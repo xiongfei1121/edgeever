@@ -6,7 +6,14 @@ import {
   getNextSyncQueueRetryDelay,
   getSyncRetryAt,
   getSyncRetryDelayMs,
+  hasSyncCursorRewound,
+  hasSyncIdentityChanged,
+  hasSyncStateReset,
+  isSyncMetadataInitialized,
   isMemoSyncBaseCurrent,
+  memoUpdatePayloadMatchesRemote,
+  resolveSameDeviceMemoSyncRecovery,
+  splitSyncBootstrapWriteBatches,
   summarizeSyncQueue,
 } from "./sync.ts";
 
@@ -81,5 +88,65 @@ describe("shared sync queue contract", () => {
       currentContentHash: "remote-hash",
       source: "offline_sync",
     });
+  });
+
+  test("treats a lost acknowledgement of the same payload as already applied", () => {
+    const current = { revision: 10, contentHash: "cloud-a" };
+    const expected = { expectedRevision: 9, expectedContentHash: "cloud-before-a" };
+
+    expect(resolveSameDeviceMemoSyncRecovery({
+      current,
+      expected,
+      payloadMatchesRemote: true,
+      remoteProducedLocally: false,
+    })).toBe("ack");
+    expect(memoUpdatePayloadMatchesRemote(
+      { title: "", tags: [], contentMarkdown: "我们和客户签合同包含了几期。", contentJson: { type: "doc" } },
+      { title: "无标题笔记", tags: [], contentMarkdown: "我们和客户签合同包含了几期。", contentJson: { type: "doc" } },
+    )).toBe(true);
+  });
+
+  test("rebases a later local draft when this device produced the cloud snapshot", () => {
+    const current = { revision: 10, contentHash: "cloud-a" };
+    const expected = { expectedRevision: 9, expectedContentHash: "cloud-before-a" };
+
+    expect(resolveSameDeviceMemoSyncRecovery({
+      current,
+      expected,
+      payloadMatchesRemote: false,
+      remoteProducedLocally: true,
+    })).toBe("rebase");
+  });
+
+  test("keeps a genuine remote edit as a conflict", () => {
+    expect(resolveSameDeviceMemoSyncRecovery({
+      current: { revision: 10, contentHash: "cloud-other" },
+      expected: { expectedRevision: 9, expectedContentHash: "cloud-before-a" },
+      payloadMatchesRemote: false,
+      remoteProducedLocally: false,
+    })).toBe("conflict");
+    expect(memoUpdatePayloadMatchesRemote(
+      { title: "无标题笔记", tags: [], contentMarkdown: "本地草稿", contentJson: { type: "doc", content: [] } },
+      { title: "无标题笔记", tags: [], contentMarkdown: "别人改过", contentJson: { type: "doc", content: [] } },
+    )).toBe(false);
+  });
+
+  test("detects a reset shared by mobile and desktop mirrors", () => {
+    expect(hasSyncCursorRewound(42, 7)).toBe(true);
+    expect(hasSyncCursorRewound(42, 42)).toBe(false);
+    expect(hasSyncIdentityChanged("workspace-a", "workspace-b")).toBe(true);
+    expect(hasSyncIdentityChanged("workspace-a", "workspace-a")).toBe(false);
+    expect(hasSyncStateReset(
+      { cursor: 42, syncIdentity: "workspace-a" },
+      { serverCursor: 64, syncIdentity: "workspace-b" },
+    )).toBe(true);
+  });
+
+  test("validates mirror metadata and splits bootstrap writes", () => {
+    expect(isSyncMetadataInitialized("42", "workspace-a")).toBe(true);
+    expect(isSyncMetadataInitialized("not-a-number", "workspace-a")).toBe(false);
+    expect(splitSyncBootstrapWriteBatches(Array.from({ length: 123 }, (_, index) => index), 50)
+      .map((batch) => batch.length)).toEqual([50, 50, 23]);
+    expect(splitSyncBootstrapWriteBatches([], 50)).toEqual([[]]);
   });
 });

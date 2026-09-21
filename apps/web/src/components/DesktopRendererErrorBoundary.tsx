@@ -1,4 +1,6 @@
 import React, { type ErrorInfo, type ReactNode } from "react";
+import { markRendererRecoveryRequired } from "@/lib/renderer-recovery";
+import { reportDesktopRendererReadyAfterPaint } from "@/lib/desktop-renderer-ready";
 
 type RendererErrorDetails = {
   kind: "react-error";
@@ -30,6 +32,7 @@ export class DesktopRendererErrorBoundary extends React.Component<{ children: Re
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
+    markRendererRecoveryRequired();
     const details: RendererErrorDetails = {
       kind: "react-error",
       message: error.message,
@@ -39,6 +42,7 @@ export class DesktopRendererErrorBoundary extends React.Component<{ children: Re
     this.setState({ error: details });
     console.error("Caught React renderer error", error, info.componentStack);
     void window.edgeeverDesktop?.recordRendererError(details).catch(() => undefined);
+    reportDesktopRendererReadyAfterPaint();
   }
 
   private report = async () => {
@@ -59,29 +63,29 @@ export class DesktopRendererErrorBoundary extends React.Component<{ children: Re
 
     return (
       <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6 text-slate-900">
-        <section className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-sm" role="alert">
+        <section className="w-full max-w-lg rounded-2xl border border-slate-200 bg-card p-6 shadow-sm" role="alert">
           <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-full bg-rose-50 text-xl text-rose-700">!</div>
           <h1 className="text-lg font-semibold">{zh ? "EdgeEver 页面出现异常" : "EdgeEver encountered a page error"}</h1>
           <p className="mt-2 text-sm leading-6 text-slate-600">
             {desktop
               ? (zh
-                  ? "问题已经记录到这台设备。你可以重新加载继续使用，并在提交前检查脱敏后的 GitHub Issue。"
-                  : "The problem was recorded on this device. You can reload to continue and review the redacted GitHub Issue before submitting it.")
+                  ? "问题已经记录到这台设备。重新加载后会进入安全启动模式，不再自动打开刚才的笔记。"
+                  : "The problem was recorded on this device. Reloading will enter safe startup mode instead of reopening the previous note.")
               : (zh
-                  ? "你可以重新加载继续使用。如果问题仍然出现，请检查浏览器控制台，并在提交 GitHub Issue 前移除敏感信息。"
-                  : "Reload to continue. If the problem persists, check the browser console and remove sensitive information before submitting a GitHub Issue.")}
+                  ? "安全重新加载后不会自动打开刚才的笔记。如果问题仍然出现，请检查浏览器控制台。"
+                  : "A safe reload will avoid reopening the previous note. If the problem persists, check the browser console.")}
           </p>
           <div className="mt-5 flex flex-wrap gap-3">
             <button
-              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
               type="button"
               onClick={() => window.location.reload()}
             >
-              {zh ? "重新加载" : "Reload"}
+              {zh ? "安全重新加载" : "Reload safely"}
             </button>
             {desktop ? (
               <button
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+                className="rounded-lg border border-slate-300 bg-card px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
                 type="button"
                 disabled={this.state.reporting}
                 onClick={() => void this.report()}

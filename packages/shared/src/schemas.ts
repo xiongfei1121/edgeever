@@ -28,6 +28,7 @@ export const NotebookUpdateSchema = z.object({
 export const MemoCreateSchema = z.object({
   notebookId: z.string().trim().min(1),
   title: z.string().trim().max(160).optional(),
+  contentJson: z.unknown().optional(),
   contentMarkdown: z.string().optional(),
   tags: z.array(z.string()).optional(),
   createdAt: z.string().datetime().optional(),
@@ -71,6 +72,82 @@ export const TemplateUpdateSchema = z.object({
 export const TemplateUseSchema = z.object({
   notebookId: z.string().trim().min(1),
 });
+
+const ScheduledPluginCommandPayloadSchema = z.object({
+  pluginId: z.string().trim().min(3).max(200),
+  commandId: z.string().trim().min(1).max(200),
+});
+
+export const ScheduledTaskCreateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  taskType: z.literal("plugin-command"),
+  taskPayload: ScheduledPluginCommandPayloadSchema,
+  cronExpression: z.string().trim().min(1).max(160),
+  timezone: z.string().trim().min(1).max(80),
+  executorDeviceId: z.string().trim().min(16).max(160),
+  missedRunPolicy: z.enum(["run-once", "skip"]).default("run-once"),
+  isEnabled: z.boolean().default(true),
+});
+
+export const ScheduledTaskUpdateSchema = ScheduledTaskCreateSchema.omit({
+  taskType: true,
+  taskPayload: true,
+  executorDeviceId: true,
+}).partial().extend({
+  taskPayload: ScheduledPluginCommandPayloadSchema.optional(),
+  executorDeviceId: z.string().trim().min(16).max(160).optional(),
+}).refine((input) => Object.values(input).some((value) => value !== undefined), {
+  message: "At least one field is required.",
+});
+
+export const PluginScheduleUpsertSchema = z.object({
+  pluginId: z.string().trim().min(3).max(200),
+  scheduleKey: z.string().trim().regex(/^[a-z0-9][a-z0-9._-]*$/i).max(120),
+  name: z.string().trim().min(1).max(120),
+  commandId: z.string().trim().min(1).max(200),
+  cronExpression: z.string().trim().min(1).max(160),
+  timezone: z.string().trim().min(1).max(80),
+  executorDeviceId: z.string().trim().min(16).max(160),
+  missedRunPolicy: z.enum(["run-once", "skip"]).default("run-once"),
+  isEnabled: z.boolean().optional(),
+});
+
+export const ScheduledTaskClaimSchema = z.object({
+  scheduledFor: z.string().datetime(),
+  executorDeviceId: z.string().trim().min(16).max(160),
+});
+
+export const ScheduledTaskFinishSchema = z.object({
+  executorDeviceId: z.string().trim().min(16).max(160),
+  status: z.enum(["succeeded", "failed"]),
+  errorMessage: z.string().trim().max(2_000).nullable().optional(),
+});
+
+const httpUrl = z.string().trim().max(2000).refine((value) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}, { message: "URL must use http or https." });
+
+export const WorkspaceExtensionUpsertSchema = z.object({
+  type: z.enum(["plugin", "theme"]),
+  version: z.string().trim().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).max(80),
+  enabled: z.boolean(),
+  installedAt: z.string().datetime(),
+  manifestUrl: httpUrl,
+  sourceKind: z.enum(["marketplace", "github", "manifest"]),
+  verified: z.boolean(),
+  repositoryUrl: httpUrl.max(500).nullable().optional(),
+  releaseTag: z.string().trim().min(1).max(80).nullable().optional(),
+  publisher: z.literal("edgeever").nullable().optional(),
+}).refine((input) => {
+  if (input.sourceKind === "github") return Boolean(input.repositoryUrl);
+  if (input.sourceKind === "marketplace") return Boolean(input.repositoryUrl || input.manifestUrl);
+  return true;
+}, { message: "GitHub and marketplace extensions require a source URL." });
 
 export const MoveMemosSchema = z.object({
   memoIds: z.array(z.string().trim().min(1)).min(1).max(100),
@@ -255,7 +332,8 @@ export const AiGenerateSchema = z.object({
   if (!input.promptId && input.action === "custom" && !input.instruction) {
     context.addIssue({ code: "custom", path: ["instruction"], message: "An instruction is required for a custom action." });
   }
-  if (!input.title && !input.contentMarkdown.trim() && input.attachments.length === 0) {
+  const canGenerateWithoutSource = input.action === "custom" && Boolean(input.instruction || input.promptId);
+  if (!input.title && !input.contentMarkdown.trim() && input.attachments.length === 0 && !canGenerateWithoutSource) {
     context.addIssue({ code: "custom", path: ["contentMarkdown"], message: "Note content is required." });
   }
   const totalAttachmentBytes = input.attachments.reduce(
@@ -304,12 +382,26 @@ export const AiPromptTemplateUpdateSchema = z.object({
   message: "At least one field is required.",
 });
 
+export const MemoShareUpdateSchema = z.object({
+  passwordProtected: z.boolean(),
+});
+
+export const PublicShareUnlockSchema = z.object({
+  password: z.string().min(1).max(64),
+});
+
 export type NotebookCreateInput = z.infer<typeof NotebookCreateSchema>;
 export type NotebookUpdateInput = z.infer<typeof NotebookUpdateSchema>;
 export type MemoCreateInput = z.infer<typeof MemoCreateSchema>;
 export type MemoUpdateInput = z.infer<typeof MemoUpdateSchema>;
 export type TemplateCreateInput = z.infer<typeof TemplateCreateSchema>;
 export type TemplateUpdateInput = z.infer<typeof TemplateUpdateSchema>;
+export type ScheduledTaskCreateInput = z.input<typeof ScheduledTaskCreateSchema>;
+export type ScheduledTaskUpdateInput = z.infer<typeof ScheduledTaskUpdateSchema>;
+export type PluginScheduleUpsertInput = z.input<typeof PluginScheduleUpsertSchema>;
+export type ScheduledTaskClaimInput = z.infer<typeof ScheduledTaskClaimSchema>;
+export type ScheduledTaskFinishInput = z.infer<typeof ScheduledTaskFinishSchema>;
+export type WorkspaceExtensionUpsertInput = z.infer<typeof WorkspaceExtensionUpsertSchema>;
 export type MoveMemosInput = z.infer<typeof MoveMemosSchema>;
 export type DeleteMemosInput = z.infer<typeof DeleteMemosSchema>;
 export type MergeMemosInput = z.infer<typeof MergeMemosSchema>;
@@ -334,3 +426,5 @@ export type AiTagSuggestionsRequestInput = z.infer<typeof AiTagSuggestionsReques
 export type AiTagSuggestionPromptUpdateInput = z.infer<typeof AiTagSuggestionPromptUpdateSchema>;
 export type AiPromptTemplateCreateInput = z.input<typeof AiPromptTemplateCreateSchema>;
 export type AiPromptTemplateUpdateInput = z.infer<typeof AiPromptTemplateUpdateSchema>;
+export type MemoShareUpdateInput = z.infer<typeof MemoShareUpdateSchema>;
+export type PublicShareUnlockInput = z.infer<typeof PublicShareUnlockSchema>;

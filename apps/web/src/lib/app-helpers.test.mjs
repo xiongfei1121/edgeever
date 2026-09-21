@@ -1,27 +1,42 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   DEFAULT_SHORTCUT_SETTINGS,
-  DEFAULT_SYNC_INTERVAL_MS,
   DESKTOP_FOCUS_MODE_STORAGE_KEY,
   DESKTOP_READING_PROTECTION_STORAGE_KEY,
+  NOTEBOOK_SIDEBAR_COLLAPSED_STORAGE_KEY,
+  EDITOR_OUTLINE_COLLAPSED_STORAGE_KEY,
   EDITOR_CONTENT_ALIGNMENT_STORAGE_KEY,
+  EDITOR_TOOLBAR_EXPANDED_STORAGE_KEY,
+  EDITOR_PHONE_PREVIEW_STORAGE_KEY,
+  EDITOR_PHONE_PREVIEW_FOLLOW_STORAGE_KEY,
   NOTEBOOK_SORT_STORAGE_KEY,
   SHORTCUT_SETTINGS_STORAGE_KEY,
-  SYNC_INTERVAL_STORAGE_KEY,
   getSearchShortcutScope,
   getShortcutActionForEvent,
   getNotebookSortComparator,
   readEditorContentAlignmentPreference,
   readNotebookSortPreference,
-  readSyncIntervalPreference,
   readDesktopFocusModePreference,
   readDesktopReadingProtectionPreference,
+  readNotebookSidebarCollapsedPreference,
+  readEditorOutlineCollapsedPreference,
+  readEditorToolbarExpandedPreference,
+  readEditorPhonePreviewPreference,
+  readEditorPhonePreviewFollowPreference,
   readShortcutSettingsPreference,
   writeEditorContentAlignmentPreference,
   writeNotebookSortPreference,
-  writeSyncIntervalPreference,
   writeDesktopFocusModePreference,
   writeDesktopReadingProtectionPreference,
+  writeNotebookSidebarCollapsedPreference,
+  writeEditorOutlineCollapsedPreference,
+  writeEditorToolbarExpandedPreference,
+  writeEditorPhonePreviewPreference,
+  writeEditorPhonePreviewFollowPreference,
+  resolveSelectionMoveTargetNotebookId,
+  getMemoIdsNeedingMove,
+  getActiveBlockValue,
+  parseHeadingBlockValue,
 } from "./app-helpers.ts";
 
 const originalWindow = globalThis.window;
@@ -95,6 +110,113 @@ describe("desktop focus mode preference", () => {
   });
 });
 
+describe("notebook sidebar collapsed preference", () => {
+  test("defaults to expanded and only accepts an explicit true value", () => {
+    installLocalStorage();
+    expect(readNotebookSidebarCollapsedPreference()).toBe(false);
+
+    const values = installLocalStorage();
+    values.set(NOTEBOOK_SIDEBAR_COLLAPSED_STORAGE_KEY, "false");
+    expect(readNotebookSidebarCollapsedPreference()).toBe(false);
+
+    values.set(NOTEBOOK_SIDEBAR_COLLAPSED_STORAGE_KEY, "true");
+    expect(readNotebookSidebarCollapsedPreference()).toBe(true);
+  });
+
+  test("persists collapsed and expanded values", () => {
+    const values = installLocalStorage();
+
+    writeNotebookSidebarCollapsedPreference(true);
+    expect(values.get(NOTEBOOK_SIDEBAR_COLLAPSED_STORAGE_KEY)).toBe("true");
+
+    writeNotebookSidebarCollapsedPreference(false);
+    expect(values.get(NOTEBOOK_SIDEBAR_COLLAPSED_STORAGE_KEY)).toBe("false");
+  });
+
+  test("fails closed when local storage is unavailable", () => {
+    globalThis.window = {
+      localStorage: {
+        getItem: () => {
+          throw new Error("blocked");
+        },
+        setItem: () => {
+          throw new Error("blocked");
+        },
+      },
+    };
+
+    expect(readNotebookSidebarCollapsedPreference()).toBe(false);
+    expect(() => writeNotebookSidebarCollapsedPreference(true)).not.toThrow();
+  });
+});
+
+describe("editor toolbar expanded preference", () => {
+  test("defaults to collapsed and only accepts an explicit true value", () => {
+    const values = installLocalStorage();
+    expect(readEditorToolbarExpandedPreference()).toBe(false);
+
+    values.set(EDITOR_TOOLBAR_EXPANDED_STORAGE_KEY, "false");
+    expect(readEditorToolbarExpandedPreference()).toBe(false);
+
+    values.set(EDITOR_TOOLBAR_EXPANDED_STORAGE_KEY, "true");
+    expect(readEditorToolbarExpandedPreference()).toBe(true);
+  });
+
+  test("persists expanded and collapsed values", () => {
+    const values = installLocalStorage();
+
+    writeEditorToolbarExpandedPreference(true);
+    expect(values.get(EDITOR_TOOLBAR_EXPANDED_STORAGE_KEY)).toBe("true");
+
+    writeEditorToolbarExpandedPreference(false);
+    expect(values.get(EDITOR_TOOLBAR_EXPANDED_STORAGE_KEY)).toBe("false");
+  });
+});
+
+describe("editor phone preview preference", () => {
+  test("defaults to hidden and only accepts an explicit true value", () => {
+    const values = installLocalStorage();
+    expect(readEditorPhonePreviewPreference()).toBe(false);
+
+    values.set(EDITOR_PHONE_PREVIEW_STORAGE_KEY, "false");
+    expect(readEditorPhonePreviewPreference()).toBe(false);
+
+    values.set(EDITOR_PHONE_PREVIEW_STORAGE_KEY, "true");
+    expect(readEditorPhonePreviewPreference()).toBe(true);
+  });
+
+  test("persists phone preview visibility", () => {
+    const values = installLocalStorage();
+
+    writeEditorPhonePreviewPreference(true);
+    expect(values.get(EDITOR_PHONE_PREVIEW_STORAGE_KEY)).toBe("true");
+
+    writeEditorPhonePreviewPreference(false);
+    expect(values.get(EDITOR_PHONE_PREVIEW_STORAGE_KEY)).toBe("false");
+  });
+
+  test("defaults phone preview scroll following to on", () => {
+    const values = installLocalStorage();
+    expect(readEditorPhonePreviewFollowPreference()).toBe(true);
+
+    values.set(EDITOR_PHONE_PREVIEW_FOLLOW_STORAGE_KEY, "false");
+    expect(readEditorPhonePreviewFollowPreference()).toBe(false);
+
+    values.set(EDITOR_PHONE_PREVIEW_FOLLOW_STORAGE_KEY, "true");
+    expect(readEditorPhonePreviewFollowPreference()).toBe(true);
+  });
+
+  test("persists phone preview scroll following", () => {
+    const values = installLocalStorage();
+
+    writeEditorPhonePreviewFollowPreference(false);
+    expect(values.get(EDITOR_PHONE_PREVIEW_FOLLOW_STORAGE_KEY)).toBe("false");
+
+    writeEditorPhonePreviewFollowPreference(true);
+    expect(values.get(EDITOR_PHONE_PREVIEW_FOLLOW_STORAGE_KEY)).toBe("true");
+  });
+});
+
 describe("desktop reading protection preference", () => {
   test("defaults to editing and only accepts an explicit true value", () => {
     const values = installLocalStorage();
@@ -131,6 +253,45 @@ describe("desktop reading protection preference", () => {
 
     expect(readDesktopReadingProtectionPreference()).toBe(false);
     expect(() => writeDesktopReadingProtectionPreference(true)).not.toThrow();
+  });
+});
+
+describe("editor outline preference", () => {
+  test("defaults to collapsed and only expands for an explicit false value", () => {
+    const values = installLocalStorage();
+    expect(readEditorOutlineCollapsedPreference()).toBe(true);
+
+    values.set(EDITOR_OUTLINE_COLLAPSED_STORAGE_KEY, "true");
+    expect(readEditorOutlineCollapsedPreference()).toBe(true);
+
+    values.set(EDITOR_OUTLINE_COLLAPSED_STORAGE_KEY, "false");
+    expect(readEditorOutlineCollapsedPreference()).toBe(false);
+  });
+
+  test("persists collapsed and expanded states", () => {
+    const values = installLocalStorage();
+
+    writeEditorOutlineCollapsedPreference(false);
+    expect(values.get(EDITOR_OUTLINE_COLLAPSED_STORAGE_KEY)).toBe("false");
+
+    writeEditorOutlineCollapsedPreference(true);
+    expect(values.get(EDITOR_OUTLINE_COLLAPSED_STORAGE_KEY)).toBe("true");
+  });
+
+  test("falls back to collapsed when local storage is unavailable", () => {
+    globalThis.window = {
+      localStorage: {
+        getItem: () => {
+          throw new Error("blocked");
+        },
+        setItem: () => {
+          throw new Error("blocked");
+        },
+      },
+    };
+
+    expect(readEditorOutlineCollapsedPreference()).toBe(true);
+    expect(() => writeEditorOutlineCollapsedPreference(false)).not.toThrow();
   });
 });
 
@@ -191,53 +352,6 @@ describe("custom notebook sorting", () => {
     ];
 
     expect(notebooks.sort(compare).map((item) => item.id)).toEqual(["first", "second", "third"]);
-  });
-});
-
-describe("automatic sync interval preference", () => {
-  test("defaults to 30 seconds", () => {
-    installLocalStorage();
-    expect(readSyncIntervalPreference()).toBe(DEFAULT_SYNC_INTERVAL_MS);
-    expect(DEFAULT_SYNC_INTERVAL_MS).toBe(30_000);
-  });
-
-  test("reads and writes sync intervals", () => {
-    const values = installLocalStorage();
-
-    writeSyncIntervalPreference("30s");
-    expect(values.get(SYNC_INTERVAL_STORAGE_KEY)).toBe("30s");
-    expect(readSyncIntervalPreference()).toBe(30_000);
-
-    writeSyncIntervalPreference("5m");
-    expect(values.get(SYNC_INTERVAL_STORAGE_KEY)).toBe("5m");
-    expect(readSyncIntervalPreference()).toBe(300_000);
-  });
-
-  test("preserves the legacy preference stored under the old key", () => {
-    const values = installLocalStorage();
-    values.set("edgeever.autoSaveInterval", "15m");
-    expect(readSyncIntervalPreference()).toBe(900_000);
-  });
-
-  test("migrates the former one-minute default to 30 seconds", () => {
-    const values = installLocalStorage();
-    values.set(SYNC_INTERVAL_STORAGE_KEY, "1m");
-    expect(readSyncIntervalPreference()).toBe(30_000);
-  });
-
-  test("falls back to the default for unknown or unavailable storage", () => {
-    const values = installLocalStorage();
-    values.set(SYNC_INTERVAL_STORAGE_KEY, "unexpected");
-    expect(readSyncIntervalPreference()).toBe(30_000);
-
-    globalThis.window = {
-      localStorage: {
-        getItem: () => {
-          throw new Error("blocked");
-        },
-      },
-    };
-    expect(readSyncIntervalPreference()).toBe(30_000);
   });
 });
 
@@ -374,5 +488,58 @@ describe("workspace shortcut preferences", () => {
       keyboardEvent("!", { code: "Digit1", ctrlKey: true, shiftKey: true }),
       DEFAULT_SHORTCUT_SETTINGS,
     )).toBe("toggleOutline");
+  });
+});
+
+describe("selection move target", () => {
+  test("keeps a valid user-chosen notebook instead of snapping back to the current notebook", () => {
+    expect(resolveSelectionMoveTargetNotebookId("target-2", ["inbox", "target-2"], "inbox")).toBe("target-2");
+  });
+
+  test("falls back to the current notebook only when the stored target is missing or invalid", () => {
+    expect(resolveSelectionMoveTargetNotebookId("", ["inbox", "archive"], "inbox")).toBe("inbox");
+    expect(resolveSelectionMoveTargetNotebookId("deleted", ["inbox", "archive"], "inbox")).toBe("inbox");
+    expect(resolveSelectionMoveTargetNotebookId("", ["inbox", "archive"], null)).toBe("inbox");
+  });
+
+  test("moves only notes that are not already in the target notebook", () => {
+    const memos = [
+      { id: "memo-1", notebookId: "inbox" },
+      { id: "memo-2", notebookId: "archive" },
+      { id: "memo-3", notebookId: "inbox" },
+    ];
+
+    expect(getMemoIdsNeedingMove(memos, ["memo-1", "memo-2", "memo-3"], "archive")).toEqual(["memo-1", "memo-3"]);
+    expect(getMemoIdsNeedingMove(memos, ["memo-2"], "archive")).toEqual([]);
+    expect(getMemoIdsNeedingMove(memos, ["memo-1"], "")).toEqual([]);
+  });
+});
+
+describe("editor heading block value", () => {
+  test("parses heading-1 through heading-6 and rejects other values", () => {
+    expect(parseHeadingBlockValue("heading-1")).toBe(1);
+    expect(parseHeadingBlockValue("heading-6")).toBe(6);
+    expect(parseHeadingBlockValue("heading-7")).toBe(null);
+    expect(parseHeadingBlockValue("paragraph")).toBe(null);
+  });
+
+  test("reports the active heading level including 4 through 6", () => {
+    const editor = {
+      isDestroyed: false,
+      extensionManager: {},
+      isActive: (name, attrs) => name === "heading" && attrs.level === 5,
+    };
+
+    expect(getActiveBlockValue(editor)).toBe("heading-5");
+    expect(getActiveBlockValue({
+      isDestroyed: false,
+      extensionManager: {},
+      isActive: (name, attrs) => name === "heading" && attrs.level === 3,
+    })).toBe("heading-3");
+    expect(getActiveBlockValue({
+      isDestroyed: false,
+      extensionManager: {},
+      isActive: () => false,
+    })).toBe("paragraph");
   });
 });

@@ -16,6 +16,10 @@ import { join, resolve, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { nativeReleaseAssetsReady } from "./check-native-release-assets.mjs";
 import { planNativeRelease } from "./plan-native-release.mjs";
+import {
+  assertWindowsUpdateSigningKey,
+  signWindowsUpdateManifest,
+} from "./sign-windows-update-manifest.mjs";
 
 const DEFAULT_REPOSITORY = "tianma-if/edgeever";
 const VERSION_BUMPS = new Set(["patch", "minor", "major"]);
@@ -42,12 +46,14 @@ export const RELEASE_VALIDATIONS = [
       "test",
       "scripts/plan-native-release.test.mjs",
       "scripts/check-native-release-assets.test.mjs",
+      "scripts/windows-update-metadata.test.mjs",
       "scripts/release.test.mjs",
       "scripts/validate-store-delivery.test.mjs",
       "scripts/store-delivery.test.mjs",
-      "scripts/configure-android-package-permissions.test.mjs",
+      "scripts/xcode-cloud-control.test.mjs",
       "scripts/download-play-universal-apk.test.mjs",
       "scripts/desktop-icns.test.mjs",
+      "scripts/verify-desktop-cross-version-startup.test.mjs",
       "apps/web/src/lib/version-check.test.mjs",
       "apps/mobile/src/lib/mobile-release.test.ts",
     ],
@@ -61,9 +67,10 @@ const usage = `Usage:
     --label bug \\
     --change-en "English user-facing change" \\
     --change-zh "中文用户更新说明" \\
+    --change-locale "ja:日本語のユーザー向け説明" \\
     --change-commit "abcdef1"
 
-Repeat --change-en, --change-zh, and --change-commit for multiple paired release bullets.
+Repeat --change-en, --change-zh, --change-locale ja:, and --change-commit for multiple paired release bullets.
 Use comma-separated SHAs when one bullet covers multiple commits. Every other
 commit requires --ignore-commit "abcdef1:reason".
 
@@ -74,7 +81,7 @@ Options:
   --label <label>            Required Issue label; may be repeated
   --change-en <text>         Required English release bullet; may be repeated
   --change-zh <text>         Required Chinese release bullet; may be repeated
-  --change-locale <tag:text> Optional localized bullet; repeat once per change and locale
+  --change-locale <tag:text> Required Japanese bullet as ja: or ja-JP:; other locales optional
   --change-commit <sha,...>  Commits covered by the corresponding bilingual bullet
   --ignore-commit <sha:why>  Explicitly exclude a non-user-facing commit; may be repeated
   --install-desktop          Install and launch the final DMG after publication
@@ -182,6 +189,11 @@ export const parseReleaseArgs = (argv) => {
     if (changes.length !== options.changesEn.length) {
       throw new Error(`--change-locale ${locale} must provide one translation for every release change.`);
     }
+  }
+  if (!localizedChanges.ja && !localizedChanges["ja-JP"]) {
+    throw new Error(
+      "--change-locale ja is required because the App Store listing includes Japanese What's New.",
+    );
   }
   options.localizedChanges = localizedChanges;
   return options;
@@ -361,7 +373,7 @@ export const buildIssueBody = ({ changesEn, changesZh, commitCoverageAudit }) =>
   "## Acceptance criteria",
   "",
   "- Required type checks, Web build, and native release planning tests pass.",
-  "- The Draft Release contains audited macOS arm64 and x64 DMGs and a Play-signed Android arm64 APK.",
+  "- The Draft Release contains audited macOS arm64/x64 DMGs, an unsigned Windows x64 Preview with an independently signed update manifest, a Linux x64 AppImage Preview with verified updater metadata, checksum, and cross-version installation, and a Play-signed Android arm64 APK.",
   "- Post-publication native asset audits pass.",
 ].join("\n");
 
@@ -527,7 +539,42 @@ const assertReleasePreconditions = ({ repository, previousTag }) => {
   }
 };
 
-const updateReleaseVersions = ({ nextVersion, desktopRebuild, mobileRebuild, changesEn, changesZh, localizedChanges }) => {
+export const updateIosMarketingVersion = (contents, nextVersion) => {
+  const updated = String(contents).replace(
+    /^MARKETING_VERSION\s*=\s*.+$/m,
+    `MARKETING_VERSION = ${nextVersion}`,
+  );
+  if (!new RegExp(`^MARKETING_VERSION\\s*=\\s*${nextVersion}$`, "m").test(updated)) {
+    throw new Error("Unable to update apps/ios/Config/Version.xcconfig MARKETING_VERSION.");
+  }
+  return updated;
+};
+
+export const updateIosProjectMarketingVersion = (contents, nextVersion) => {
+  const updated = String(contents).replace(
+    /MARKETING_VERSION = [^;]+;/g,
+    `MARKETING_VERSION = ${nextVersion};`,
+  );
+  const matches = updated.match(
+    new RegExp(`MARKETING_VERSION = ${nextVersion.replaceAll(".", "\\.")};`, "g"),
+  );
+  if (!matches || matches.length < 2) {
+    throw new Error(
+      "Unable to update apps/ios/EdgeEver.xcodeproj/project.pbxproj MARKETING_VERSION.",
+    );
+  }
+  return updated;
+};
+
+const updateReleaseVersions = ({
+  nextVersion,
+  desktopRebuild,
+  mobileRebuild,
+  iosRebuild,
+  changesEn,
+  changesZh,
+  localizedChanges,
+}) => {
   const changedPaths = ["package.json", "release-summary.json"];
   const rootPackage = readJson("package.json");
   rootPackage.version = nextVersion;
@@ -552,6 +599,23 @@ const updateReleaseVersions = ({ nextVersion, desktopRebuild, mobileRebuild, cha
     mobileConfig.expo.android.versionCode += 1;
     writeJson("apps/mobile/app.json", mobileConfig);
     changedPaths.push("apps/mobile/app.json");
+  }
+
+  if (iosRebuild) {
+    const iosVersionPath = "apps/ios/Config/Version.xcconfig";
+    const iosProjectPath = "apps/ios/EdgeEver.xcodeproj/project.pbxproj";
+    writeFileSync(
+      iosVersionPath,
+      updateIosMarketingVersion(readFileSync(iosVersionPath, "utf8"), nextVersion),
+    );
+    writeFileSync(
+      iosProjectPath,
+      updateIosProjectMarketingVersion(
+        readFileSync(iosProjectPath, "utf8"),
+        nextVersion,
+      ),
+    );
+    changedPaths.push(iosVersionPath, iosProjectPath);
   }
   return changedPaths;
 };
@@ -628,6 +692,83 @@ const listWorkflowRuns = ({ repository, workflow, event }) => ghJson([
 const releaseCheckpointMarker = (tag) =>
   `<!-- edgeever-release-checkpoint:${tag}\n`;
 
+const CHECKPOINT_RUN_FIELDS = [
+  "desktopRunId",
+  "mobileRunId",
+  "dockerRunId",
+  "storeRunId",
+  "storeRecoveryRunId",
+  "iosStoreRunId",
+  "androidPlaySignatureRunId",
+  "windowsUpdateAuditRunId",
+];
+const CANCELLABLE_CHECKPOINT_RUN_FIELDS = new Set([
+  "desktopRunId",
+  "mobileRunId",
+  "dockerRunId",
+  "iosStoreRunId",
+  "androidPlaySignatureRunId",
+  "windowsUpdateAuditRunId",
+]);
+
+export const recordCheckpointRun = (checkpoint, field, runId) => {
+  if (!CHECKPOINT_RUN_FIELDS.includes(field)) {
+    throw new Error(`Unsupported checkpoint Run field: ${field}`);
+  }
+  checkpoint[field] = Number(runId);
+  checkpoint.runHistory ??= [];
+  if (!checkpoint.runHistory.some((entry) => Number(entry.runId) === Number(runId))) {
+    checkpoint.runHistory.push({
+      field,
+      runId: Number(runId),
+      releaseSha: checkpoint.releaseSha,
+    });
+  }
+  return Number(runId);
+};
+
+export const checkpointRunIds = (checkpoint) => [...new Set([
+  ...(checkpoint.runHistory ?? []).map((entry) => Number(entry.runId)),
+  ...CHECKPOINT_RUN_FIELDS.map((field) => Number(checkpoint[field])),
+].filter((runId) => Number.isInteger(runId) && runId > 0))];
+
+export const prepareReleaseCheckpoint = ({ storedState, releaseSha }) => {
+  if (storedState.releaseSha === releaseSha) return storedState;
+  const legacyHistory = CHECKPOINT_RUN_FIELDS.flatMap((field) => {
+    const runId = Number(storedState[field]);
+    return Number.isInteger(runId) && runId > 0
+      ? [{ field, runId, releaseSha: storedState.releaseSha ?? null }]
+      : [];
+  });
+  const runHistory = [...(storedState.runHistory ?? []), ...legacyHistory]
+    .filter((entry, index, entries) =>
+      entries.findIndex((candidate) => Number(candidate.runId) === Number(entry.runId)) === index
+    );
+  return {
+    releaseSha,
+    ...(runHistory.length > 0 ? { runHistory } : {}),
+    ...(storedState.playDelivery ? { playDelivery: storedState.playDelivery } : {}),
+  };
+};
+
+export const playDeliveryResumeAction = ({
+  playDelivery,
+  tag,
+  headSha,
+  mobileInputsChanged = false,
+}) => {
+  if (!playDelivery || playDelivery.tag !== tag) return "upload";
+  if (playDelivery.releaseSha === headSha) return "verify";
+  return mobileInputsChanged ? "block" : "verify";
+};
+
+export const shouldCancelSupersededRun = ({ runView, headSha }) =>
+  Boolean(
+    runView &&
+    runView.headSha !== headSha &&
+    runView.status !== "completed",
+  );
+
 export const parseReleaseCheckpoint = (body, tag) => {
   const marker = releaseCheckpointMarker(tag);
   if (!body?.startsWith(marker)) return null;
@@ -693,6 +834,40 @@ const viewWorkflowRun = ({ repository, runId }) => ghJson([
   "--json",
   "status,conclusion,url,headSha,jobs",
 ]);
+
+const cancelSupersededCheckpointRuns = ({ repository, checkpoint, headSha }) => {
+  const candidates = CHECKPOINT_RUN_FIELDS.flatMap((field) => checkpoint[field]
+    ? [{ field, runId: checkpoint[field] }]
+    : []).filter(({ field }, index, entries) =>
+    CANCELLABLE_CHECKPOINT_RUN_FIELDS.has(field) &&
+    entries.findIndex((candidate) => Number(candidate.runId) === Number(entries[index].runId)) === index
+  );
+  for (const { field, runId } of candidates) {
+    let runView;
+    try {
+      runView = viewWorkflowRun({ repository, runId });
+    } catch {
+      console.warn(`[release] could not inspect superseded ${field} Run ${runId}; continuing`);
+      continue;
+    }
+    if (!shouldCancelSupersededRun({ runView, headSha })) continue;
+    const cancellation = run(
+      "gh",
+      ["run", "cancel", String(runId), "--repo", repository],
+      { allowFailure: true },
+    );
+    if (cancellation.status === 0) {
+      console.log(`[release] cancelled superseded ${field}: ${runView.url}`);
+    } else {
+      console.warn(`[release] superseded ${field} was no longer cancellable: ${runView.url}`);
+    }
+  }
+};
+
+export const signedWindowsUpdateAuditPassed = (runView) =>
+  runView.jobs?.some(
+    (job) => job.name === "Audit signed Windows update" && job.conclusion === "success",
+  ) ?? false;
 
 const waitForRerunStart = async ({ repository, runId }) => {
   const deadline = Date.now() + 30_000;
@@ -803,7 +978,10 @@ const dispatchStoreDeliveryWorkflow = ({
   repository,
   tag,
   headSha,
-  recoverPlayApk,
+  recoverPlayApk = false,
+  platform = "android",
+  androidTrack = "production",
+  iosBuildNumber = "",
 }) => dispatchReleaseWorkflow({
   repository,
   workflow: RELEASE_WORKFLOWS.storeDelivery,
@@ -811,9 +989,10 @@ const dispatchStoreDeliveryWorkflow = ({
   headSha,
   inputs: {
     release_tag: tag,
-    platform: "android",
-    android_track: "production",
+    platform,
+    android_track: androidTrack,
     recover_play_apk: recoverPlayApk,
+    ios_build_number: iosBuildNumber,
   },
 });
 
@@ -830,7 +1009,7 @@ const dispatchAndWaitForPlayRecovery = async ({
     headSha,
     recoverPlayApk: true,
   });
-  checkpoint.storeRecoveryRunId = recoveryRunId;
+  recordCheckpointRun(checkpoint, "storeRecoveryRunId", recoveryRunId);
   persistCheckpoint();
   await waitForRun({
     repository,
@@ -846,7 +1025,25 @@ const ensurePlayDelivery = async ({
   headSha,
   checkpoint,
   persistCheckpoint,
+  resumeAction = "upload",
 }) => {
+  const recordCompletedDelivery = ({ storeRunId = null, recoveryRunId = null }) => {
+    checkpoint.playDelivery = {
+      tag,
+      releaseSha: headSha,
+      ...(storeRunId ? { storeRunId: Number(storeRunId) } : {}),
+      ...(recoveryRunId ? { recoveryRunId: Number(recoveryRunId) } : {}),
+    };
+    persistCheckpoint();
+  };
+
+  if (resumeAction === "verify") {
+    console.log(
+      "[release] mobile inputs are unchanged since Play delivery; skipping upload and verifying the existing Play-signed APK",
+    );
+    return checkpoint.playDelivery?.recoveryRunId ?? checkpoint.playDelivery?.storeRunId ?? null;
+  }
+
   let storeRunId = checkpoint.storeRunId;
   if (!storeRunId) {
     storeRunId = await dispatchStoreDeliveryWorkflow({
@@ -855,7 +1052,7 @@ const ensurePlayDelivery = async ({
       headSha,
       recoverPlayApk: false,
     });
-    checkpoint.storeRunId = storeRunId;
+    recordCheckpointRun(checkpoint, "storeRunId", storeRunId);
     persistCheckpoint();
   } else {
     const existing = viewWorkflowRun({ repository, runId: storeRunId });
@@ -871,6 +1068,7 @@ const ensurePlayDelivery = async ({
       runId: storeRunId,
       label: "Google Play delivery",
     });
+    recordCompletedDelivery({ storeRunId });
     return storeRunId;
   } catch (error) {
     const failedRun = viewWorkflowRun({ repository, runId: storeRunId });
@@ -878,13 +1076,14 @@ const ensurePlayDelivery = async ({
       console.log(
         "[release] Play upload may have completed; recovering its signed APK without re-uploading",
       );
-      await dispatchAndWaitForPlayRecovery({
+      const recoveryRunId = await dispatchAndWaitForPlayRecovery({
         repository,
         tag,
         headSha,
         checkpoint,
         persistCheckpoint,
       });
+      recordCompletedDelivery({ storeRunId, recoveryRunId });
       return storeRunId;
     }
 
@@ -895,15 +1094,61 @@ const ensurePlayDelivery = async ({
       headSha,
       recoverPlayApk: false,
     });
-    checkpoint.storeRunId = storeRunId;
+    recordCheckpointRun(checkpoint, "storeRunId", storeRunId);
     persistCheckpoint();
     await waitForRun({
       repository,
       runId: storeRunId,
       label: "Google Play delivery retry",
     });
+    recordCompletedDelivery({ storeRunId });
     return storeRunId;
   }
+};
+
+const startIosStoreDelivery = async ({
+  repository,
+  tag,
+  headSha,
+  checkpoint,
+  persistCheckpoint,
+}) => {
+  let iosStoreRunId = checkpoint.iosStoreRunId;
+  if (iosStoreRunId) {
+    const existing = viewWorkflowRun({ repository, runId: iosStoreRunId });
+    if (existing.headSha === headSha) {
+      if (existing.status !== "completed") {
+        console.log(`[release] reusing App Store delivery: ${existing.url}`);
+        return iosStoreRunId;
+      }
+      if (existing.conclusion === "success") {
+        console.log(`[release] App Store delivery already succeeded: ${existing.url}`);
+        return iosStoreRunId;
+      }
+      console.log(`[release] rerunning failed App Store delivery: ${existing.url}`);
+      run("gh", [
+        "run",
+        "rerun",
+        String(iosStoreRunId),
+        "--repo",
+        repository,
+        "--failed",
+      ]);
+      await waitForRerunStart({ repository, runId: iosStoreRunId });
+      return iosStoreRunId;
+    }
+  }
+
+  iosStoreRunId = await dispatchStoreDeliveryWorkflow({
+    repository,
+    tag,
+    headSha,
+    platform: "ios",
+  });
+  recordCheckpointRun(checkpoint, "iosStoreRunId", iosStoreRunId);
+  persistCheckpoint();
+  console.log("[release] started App Store delivery");
+  return iosStoreRunId;
 };
 
 const requirePlaySignedDraftApk = async ({
@@ -921,7 +1166,7 @@ const requirePlaySignedDraftApk = async ({
       tag,
       headSha,
     });
-    checkpoint.androidPlaySignatureRunId = runId;
+    recordCheckpointRun(checkpoint, "androidPlaySignatureRunId", runId);
     persistCheckpoint();
     await waitForRun({
       repository,
@@ -1011,15 +1256,63 @@ const assertDraftAssets = ({
       .map((asset) => asset.name)
       .filter((name) =>
         /^EdgeEver-.*-mac-(?:arm64|x64)\.(?:dmg|zip)(?:\.blockmap)?$/.test(name) ||
-        name === "latest-mac.yml"
+        /^EdgeEver-.*-windows-x64\.exe$/.test(name) ||
+        /^EdgeEver-.*-linux-x64\.AppImage$/.test(name) ||
+        [
+          "latest-mac.yml",
+          "latest.yml",
+          "latest-windows.json",
+          "latest-windows.json.sig",
+          "SHA256SUMS-windows.txt",
+          "latest-linux.yml",
+          "SHA256SUMS-linux.txt",
+        ].includes(name)
       );
     if (
-      previousDesktopNames.length !== 9 ||
+      previousDesktopNames.length !== 17 ||
       !previousDesktopNames.every((name) =>
         reusedAssetMatches(previousAssets, assets, name)
       )
     ) {
       throw new Error("Reused desktop asset filename, size, or checksum changed.");
+    }
+  }
+};
+
+const signDraftWindowsUpdate = ({ repository, tag }) => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "edgeever-windows-update-signing-"));
+  const manifestPath = join(temporaryDirectory, "latest-windows.json");
+  const signaturePath = `${manifestPath}.sig`;
+  try {
+    run("gh", [
+      "release",
+      "download",
+      tag,
+      "--repo",
+      repository,
+      "--pattern",
+      "latest-windows.json",
+      "--dir",
+      temporaryDirectory,
+    ]);
+    signWindowsUpdateManifest({
+      manifestPath,
+      signaturePath,
+      privateKeyPath: process.env.EDGE_EVER_WINDOWS_UPDATE_SIGNING_KEY,
+    });
+    run("gh", [
+      "release",
+      "upload",
+      tag,
+      signaturePath,
+      "--repo",
+      repository,
+      "--clobber",
+    ]);
+    console.log(`[release] signed Windows update manifest for ${tag}`);
+  } finally {
+    if (temporaryDirectory.startsWith(`${tmpdir()}${sep}edgeever-windows-update-signing-`)) {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   }
 };
@@ -1207,10 +1500,12 @@ const releaseMain = async (options) => {
   printReleaseCoverageAudit({ audit: commitCoverageAudit, changesEn: options.changesEn });
   const desktopPlan = planNativeRelease("desktop", changedFiles);
   const mobilePlan = planNativeRelease("mobile", changedFiles);
+  const iosPlan = planNativeRelease("ios", changedFiles);
 
   console.log(`[release] ${releaseBaseTag} -> ${tag}`);
   console.log(`[release] desktop: ${desktopPlan.rebuild ? "rebuild" : "reuse"}`);
   console.log(`[release] Android: ${mobilePlan.rebuild ? "rebuild" : "reuse"}`);
+  console.log(`[release] iOS: ${iosPlan.rebuild ? "rebuild" : "reuse"}`);
 
   if (options.dryRun) {
     console.log(buildReleaseNotes({
@@ -1220,6 +1515,13 @@ const releaseMain = async (options) => {
       issueNumber: 0,
     }));
     return;
+  }
+
+  if (desktopPlan.rebuild) {
+    assertWindowsUpdateSigningKey({
+      privateKeyPath: process.env.EDGE_EVER_WINDOWS_UPDATE_SIGNING_KEY,
+    });
+    console.log("[release] Windows update signing key matches the pinned desktop trust anchor");
   }
 
   let issueNumber;
@@ -1257,8 +1559,10 @@ const releaseMain = async (options) => {
       nextVersion: releaseVersion,
       desktopRebuild: desktopPlan.rebuild,
       mobileRebuild: mobilePlan.rebuild,
+      iosRebuild: iosPlan.rebuild,
       changesEn: options.changesEn,
       changesZh: options.changesZh,
+      localizedChanges: options.localizedChanges,
     });
     run("git", ["add", ...versionPaths]);
     run("git", ["diff", "--cached", "--check"]);
@@ -1294,10 +1598,17 @@ const releaseMain = async (options) => {
     tag,
   });
   let checkpointCommentId = storedCheckpoint.commentId;
-  const checkpoint =
-    storedCheckpoint.state.releaseSha === releaseSha
-      ? storedCheckpoint.state
-      : { releaseSha };
+  if (storedCheckpoint.state.releaseSha && storedCheckpoint.state.releaseSha !== releaseSha) {
+    cancelSupersededCheckpointRuns({
+      repository: options.repository,
+      checkpoint: storedCheckpoint.state,
+      headSha: releaseSha,
+    });
+  }
+  const checkpoint = prepareReleaseCheckpoint({
+    storedState: storedCheckpoint.state,
+    releaseSha,
+  });
   const persistCheckpoint = () => {
     checkpointCommentId = saveReleaseCheckpoint({
       repository: options.repository,
@@ -1309,6 +1620,34 @@ const releaseMain = async (options) => {
   };
   persistCheckpoint();
 
+  let playDeliveryAction = "upload";
+  if (mobilePlan.rebuild && checkpoint.playDelivery?.tag === tag) {
+    const deliveredSha = checkpoint.playDelivery.releaseSha;
+    const deliveredTargetIsAncestor = run(
+      "git",
+      ["merge-base", "--is-ancestor", deliveredSha, releaseSha],
+      { allowFailure: true },
+    ).status === 0;
+    if (!deliveredTargetIsAncestor) {
+      throw new Error("Stored Play delivery is not an ancestor of the current Draft target.");
+    }
+    const mobileInputsChanged = planNativeRelease(
+      "mobile",
+      changedFilesBetween(deliveredSha, releaseSha),
+    ).rebuild;
+    playDeliveryAction = playDeliveryResumeAction({
+      playDelivery: checkpoint.playDelivery,
+      tag,
+      headSha: releaseSha,
+      mobileInputsChanged,
+    });
+    if (playDeliveryAction === "block") {
+      throw new Error(
+        "Mobile release inputs changed after this versionCode was delivered to Google Play. Withdraw this Draft and prepare a new version/versionCode instead of re-uploading the immutable Play version.",
+      );
+    }
+  }
+
   const resolveDraftRun = async (field, workflow, label) => {
     const reusableRunId = resumedDraft
       ? await resumeDraftWorkflowRun({
@@ -1318,12 +1657,15 @@ const releaseMain = async (options) => {
           label,
         })
       : null;
-    return reusableRunId ?? dispatchReleaseWorkflow({
+    const runId = reusableRunId ?? await dispatchReleaseWorkflow({
       repository: options.repository,
       workflow,
       tag,
       headSha: releaseSha,
     });
+    recordCheckpointRun(checkpoint, field, runId);
+    persistCheckpoint();
+    return runId;
   };
 
   const [desktopRunId, mobileRunId, dockerRunId] = await Promise.all([
@@ -1331,8 +1673,16 @@ const releaseMain = async (options) => {
     resolveDraftRun("mobileRunId", RELEASE_WORKFLOWS.mobile, "Draft Android assets"),
     resolveDraftRun("dockerRunId", RELEASE_WORKFLOWS.docker, "Draft Docker image"),
   ]);
-  Object.assign(checkpoint, { desktopRunId, mobileRunId, dockerRunId });
-  persistCheckpoint();
+
+  if (iosPlan.rebuild) {
+    await startIosStoreDelivery({
+      repository: options.repository,
+      tag,
+      headSha: releaseSha,
+      checkpoint,
+      persistCheckpoint,
+    });
+  }
 
   const androidReleaseReady = (async () => {
     await waitForRun({
@@ -1347,6 +1697,7 @@ const releaseMain = async (options) => {
         headSha: releaseSha,
         checkpoint,
         persistCheckpoint,
+        resumeAction: playDeliveryAction,
       });
     }
     await requirePlaySignedDraftApk({
@@ -1372,6 +1723,37 @@ const releaseMain = async (options) => {
     }),
     androidReleaseReady,
   ]);
+
+  let windowsUpdateAuditRunId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (desktopPlan.rebuild) {
+      signDraftWindowsUpdate({ repository: options.repository, tag });
+    }
+    windowsUpdateAuditRunId = await dispatchReleaseWorkflow({
+      repository: options.repository,
+      workflow: RELEASE_WORKFLOWS.desktop,
+      tag,
+      headSha: releaseSha,
+    });
+    recordCheckpointRun(checkpoint, "windowsUpdateAuditRunId", windowsUpdateAuditRunId);
+    persistCheckpoint();
+    await waitForRun({
+      repository: options.repository,
+      runId: windowsUpdateAuditRunId,
+      label: "Draft signed Windows update audit",
+    });
+    const auditRun = viewWorkflowRun({
+      repository: options.repository,
+      runId: windowsUpdateAuditRunId,
+    });
+    if (signedWindowsUpdateAuditPassed(auditRun)) break;
+    if (!desktopPlan.rebuild || attempt === 3) {
+      throw new Error("Draft signed Windows update workflow completed without running its audit job.");
+    }
+    console.log(
+      "[release] desktop assets changed while preparing the signature; signing the latest manifest and retrying its audit",
+    );
+  }
 
   const draft = ghJson([
     "release",
@@ -1476,6 +1858,22 @@ const releaseMain = async (options) => {
     throw error;
   }
 
+  if (iosPlan.rebuild) {
+    try {
+      await waitForRun({
+        repository: options.repository,
+        runId: checkpoint.iosStoreRunId,
+        label: "App Store delivery",
+      });
+    } catch (error) {
+      console.error(
+        "[release] GitHub Release is published; App Store delivery failed and must be retried with bun run publish:stores -- --release "
+        + `${tag} --platform ios`,
+      );
+      throw error;
+    }
+  }
+
   run("gh", [
     "issue",
     "comment",
@@ -1485,6 +1883,12 @@ const releaseMain = async (options) => {
     "--body",
     `Released in [${tag}](${releaseUrl}).\n\nRequired local validations, Draft asset and image preparation, and post-publication audits passed.`,
   ]);
+  const timingStoreRunId =
+    checkpoint.storeRecoveryRunId ??
+    checkpoint.storeRunId ??
+    checkpoint.playDelivery?.recoveryRunId ??
+    checkpoint.playDelivery?.storeRunId;
+  const timingAttemptRunIds = checkpointRunIds(checkpoint).join(",");
   const timingDispatch = run("gh", [
     "workflow",
     "run",
@@ -1509,8 +1913,14 @@ const releaseMain = async (options) => {
     `mobile_mode=${mobilePlan.rebuild ? "rebuild" : "reuse"}`,
     "-f",
     `docker_run_id=${dockerRunId}`,
-    ...(checkpoint.storeRunId
-      ? ["-f", `store_run_id=${checkpoint.storeRunId}`]
+    ...(timingStoreRunId
+      ? [
+          "-f",
+          `store_run_id=${timingStoreRunId}`,
+        ]
+      : []),
+    ...(timingAttemptRunIds
+      ? ["-f", `attempt_run_ids=${timingAttemptRunIds}`]
       : []),
   ], { allowFailure: true });
   if (timingDispatch.status === 0) {

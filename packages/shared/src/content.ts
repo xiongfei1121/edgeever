@@ -1,8 +1,8 @@
-import Image from "@tiptap/extension-image";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
-import { TableKit } from "@tiptap/extension-table";
-import { Markdown, MarkdownManager } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { MarkdownManager } from "@tiptap/markdown";
+import {
+  createEdgeEverDocumentExtensions,
+  type CreateEdgeEverDocumentExtensionsOptions,
+} from "./document-extensions";
 import { MergeDivider, MERGE_DIVIDER_NODE_TYPE } from "./merge-divider";
 import { PdfAttachment, PDF_ATTACHMENT_NODE_TYPE, upgradeStandalonePdfLinks } from "./pdf-attachment";
 import { FileAttachment, FILE_ATTACHMENT_NODE_TYPE, upgradeStandaloneFileLinks } from "./file-attachment";
@@ -12,6 +12,11 @@ import {
   INLINE_MATH_NODE_TYPE,
 } from "./mathematics-markdown";
 import { projectNativeUnknownContentForMarkdown } from "./mobile-content-compatibility";
+import { PluginEmbed, PLUGIN_EMBED_NODE_TYPE } from "./plugin-embed";
+import { ImageGallery, IMAGE_GALLERY_NODE_TYPE, normalizeImageGalleries } from "./image-gallery";
+
+export { PluginEmbed, PLUGIN_EMBED_NODE_TYPE, pluginEmbedToMarkdown, normalizePluginEmbedAttributes } from "./plugin-embed";
+export type { PluginEmbedAttributes } from "./plugin-embed";
 
 export {
   BLOCK_MATH_NODE_TYPE,
@@ -39,9 +44,12 @@ export type { PdfDisplayMode } from "./pdf-attachment";
 export {
   FileAttachment,
   FILE_ATTACHMENT_NODE_TYPE,
+  FILE_DISPLAY_MODES,
   isFileAttachmentLink,
+  resolveFileDisplayMode,
   upgradeStandaloneFileLinks,
 } from "./file-attachment";
+export type { FileDisplayMode } from "./file-attachment";
 
 export type TiptapTextNode = {
   type: "text";
@@ -88,29 +96,42 @@ export const emptyDoc = (): TiptapDoc => ({
   content: [{ type: "paragraph" }],
 });
 
-const markdownManager = new MarkdownManager({
-  extensions: [
-    StarterKit,
-    TaskList,
-    TaskItem.configure({ nested: true }),
-    TableKit,
-    Image,
-    PdfAttachment,
-    FileAttachment,
-    MergeDivider,
-    ...createEdgeEverMarkdownMathematics(),
-    Markdown.configure({
-      markedOptions: { gfm: true },
-    }),
-  ],
+export const createEdgeEverMarkdownManager = (
+  options: CreateEdgeEverDocumentExtensionsOptions,
+) => new MarkdownManager({
+  extensions: createEdgeEverDocumentExtensions({
+    ...options,
+    markdown: true,
+  }),
 });
 
+const markdownManager = createEdgeEverMarkdownManager({
+  mathematics: createEdgeEverMarkdownMathematics(),
+});
+
+const PROTECTED_MARKDOWN_SEGMENT = /(```[\s\S]*?```|~~~[\s\S]*?~~~|\$\$[\s\S]*?\$\$)/g;
+
+/**
+ * CommonMark treats one or more blank lines as a single paragraph break, so two
+ * visual blank lines disappear on parse. Expand those extra newlines into the
+ * empty-paragraph spacing TipTap already understands, without touching fenced
+ * code or display-math blocks.
+ */
+const expandExtraBlankLinesForParse = (markdown: string) =>
+  markdown.split(PROTECTED_MARKDOWN_SEGMENT).map((segment) => {
+    if (segment.startsWith("```") || segment.startsWith("~~~") || segment.startsWith("$$")) {
+      return segment;
+    }
+    return segment.replace(/\n{3,}/g, (run) => "\n\n".repeat(run.length - 1));
+  }).join("");
+
 export const markdownToDoc = (markdown: string): TiptapDoc => {
-  if (!markdown.trim()) {
+  const normalized = markdown.replace(/\r\n?/g, "\n");
+  if (!normalized) {
     return emptyDoc();
   }
 
-  return markdownManager.parse(markdown.replace(/\r\n?/g, "\n")) as TiptapDoc;
+  return markdownManager.parse(expandExtraBlankLinesForParse(normalized)) as TiptapDoc;
 };
 
 const docContainsNodeType = (doc: TiptapDoc, nodeType: string): boolean => {
@@ -132,18 +153,23 @@ export const resolveMemoContentDoc = (
   contentMarkdown: string | null | undefined
 ): TiptapDoc => {
   const currentDoc = contentJson && Array.isArray(contentJson.content)
-    ? upgradeStandaloneFileLinks(upgradeStandalonePdfLinks(upgradeLegacyAttachmentLinks(contentJson)))
+    ? normalizeImageGalleries(
+        upgradeStandaloneFileLinks(upgradeStandalonePdfLinks(upgradeLegacyAttachmentLinks(contentJson))),
+      )
     : emptyDoc();
   if (
     !contentMarkdown?.trim() ||
     docContainsNodeType(currentDoc, "table") ||
     docContainsNodeType(currentDoc, "taskList") ||
     docContainsNodeType(currentDoc, "edgeeverThemeBlock") ||
+    docContainsNodeType(currentDoc, IMAGE_GALLERY_NODE_TYPE) ||
     docContainsNodeType(currentDoc, MERGE_DIVIDER_NODE_TYPE) ||
+    docContainsNodeType(currentDoc, PLUGIN_EMBED_NODE_TYPE) ||
     docContainsNodeType(currentDoc, BLOCK_MATH_NODE_TYPE) ||
     docContainsNodeType(currentDoc, INLINE_MATH_NODE_TYPE)
     || docContainsNodeType(currentDoc, PDF_ATTACHMENT_NODE_TYPE)
     || docContainsNodeType(currentDoc, FILE_ATTACHMENT_NODE_TYPE)
+    || docContainsNodeType(currentDoc, "details")
   ) {
     return currentDoc;
   }
@@ -159,6 +185,7 @@ export const resolveMemoContentDoc = (
     || docContainsNodeType(markdownDoc, MERGE_DIVIDER_NODE_TYPE)
     || docContainsNodeType(markdownDoc, BLOCK_MATH_NODE_TYPE)
     || docContainsNodeType(markdownDoc, INLINE_MATH_NODE_TYPE)
+    || docContainsNodeType(markdownDoc, "details")
     || !docToText(currentDoc)
     ? markdownDoc
     : currentDoc;

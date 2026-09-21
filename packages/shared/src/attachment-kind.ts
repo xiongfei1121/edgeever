@@ -17,6 +17,55 @@ export type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
 const extensionOf = (filename: string | null | undefined) =>
   filename?.trim().toLowerCase().match(/\.([a-z0-9]+)(?:[?#].*)?$/)?.[1] ?? "";
 
+const AUDIO_MIME_TYPES_BY_EXTENSION: Readonly<Record<string, string>> = {
+  aac: "audio/aac",
+  aiff: "audio/aiff",
+  ape: "audio/x-ape",
+  flac: "audio/flac",
+  m4a: "audio/mp4",
+  mp3: "audio/mpeg",
+  oga: "audio/ogg",
+  ogg: "audio/ogg",
+  opus: "audio/ogg",
+  wav: "audio/wav",
+  weba: "audio/webm",
+  wma: "audio/x-ms-wma",
+};
+
+/** Resolve an audio MIME type without overriding a specific type supplied by storage. */
+export const resolveAudioMimeType = (
+  mimeType: string | null | undefined,
+  filename: string | null | undefined,
+) => {
+  const mime = mimeType?.trim().toLowerCase() ?? "";
+  if (mime.startsWith("audio/")) return mime;
+  return AUDIO_MIME_TYPES_BY_EXTENSION[extensionOf(filename)] ?? null;
+};
+
+const VIDEO_MIME_TYPES_BY_EXTENSION: Readonly<Record<string, string>> = {
+  m4v: "video/mp4",
+  mov: "video/quicktime",
+  mp4: "video/mp4",
+  ogv: "video/ogg",
+  webm: "video/webm",
+};
+
+/** Resolve a video MIME type without overriding a specific type supplied by storage. */
+export const resolveVideoMimeType = (
+  mimeType: string | null | undefined,
+  filename: string | null | undefined,
+) => {
+  const mime = mimeType?.trim().toLowerCase() ?? "";
+  if (mime.startsWith("video/")) return mime;
+  return VIDEO_MIME_TYPES_BY_EXTENSION[extensionOf(filename)] ?? null;
+};
+
+/** Audio or browser-native video MIME used for inline playback and Content-Type. */
+export const resolvePlayableMediaMimeType = (
+  mimeType: string | null | undefined,
+  filename: string | null | undefined,
+) => resolveAudioMimeType(mimeType, filename) ?? resolveVideoMimeType(mimeType, filename);
+
 export const resolveAttachmentKind = (
   mimeType: string | null | undefined,
   filename: string | null | undefined,
@@ -25,8 +74,8 @@ export const resolveAttachmentKind = (
   const extension = extensionOf(filename);
 
   if (mime.startsWith("image/")) return "image";
-  if (mime.startsWith("audio/")) return "audio";
-  if (mime.startsWith("video/")) return "video";
+  if (resolveAudioMimeType(mime, filename)) return "audio";
+  if (resolveVideoMimeType(mime, filename)) return "video";
   if (mime === "application/pdf" || extension === "pdf") return "pdf";
 
   if (

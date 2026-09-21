@@ -2,6 +2,7 @@ import { Mark, Node } from "@tiptap/core";
 import type { TiptapDoc, TiptapMark, TiptapNode, TiptapTextNode } from "./content";
 import { FILE_ATTACHMENT_NODE_TYPE } from "./file-attachment";
 import { PDF_ATTACHMENT_NODE_TYPE } from "./pdf-attachment";
+import { PLUGIN_EMBED_NODE_TYPE } from "./plugin-embed";
 
 export const UNSUPPORTED_BLOCK_NODE_TYPE = "edgeeverUnsupportedBlock" as const;
 export const UNSUPPORTED_INLINE_NODE_TYPE = "edgeeverUnsupportedInline" as const;
@@ -28,6 +29,10 @@ export const NATIVE_EDITOR_NODE_TYPES = new Set<string>([
   "hardBreak",
   "horizontalRule",
   "image",
+  "details",
+  "detailsSummary",
+  "detailsContent",
+  "edgeeverImageGallery",
   "table",
   "tableRow",
   "tableHeader",
@@ -52,6 +57,7 @@ const MARKDOWN_EDITOR_NODE_TYPES = new Set<string>([
   ...NATIVE_EDITOR_NODE_TYPES,
   FILE_ATTACHMENT_NODE_TYPE,
   PDF_ATTACHMENT_NODE_TYPE,
+  PLUGIN_EMBED_NODE_TYPE,
 ]);
 
 const INLINE_PARENT_TYPES = new Set<string>(["paragraph", "heading"]);
@@ -62,12 +68,15 @@ const isTextNode = (node: TiptapNode | TiptapTextNode): node is TiptapTextNode =
 const getOriginalType = (attrs: Record<string, unknown> | undefined) =>
   typeof attrs?.originalType === "string" ? attrs.originalType : "unknown";
 
-const getFallbackLabel = (type: string, locale?: "zh-CN" | "en-US") =>
-  locale === "zh-CN" ? `暂不支持的内容：${type}` : `Unsupported content: ${type}`;
+const getFallbackLabel = (type: string, locale?: "zh-CN" | "en-US" | "ja") => {
+  if (locale === "zh-CN") return `暂不支持的内容：${type}`;
+  if (locale === "ja") return `未対応のコンテンツ: ${type}`;
+  return `Unsupported content: ${type}`;
+};
 
 const fallbackAttrs = (
   node: TiptapNode | TiptapTextNode,
-  locale?: "zh-CN" | "en-US",
+  locale?: "zh-CN" | "en-US" | "ja",
 ) => ({
   originalType: node.type,
   originalJson: JSON.stringify(node),
@@ -215,7 +224,7 @@ const prepareTextNode = (node: TiptapTextNode): TiptapTextNode => {
  */
 export const prepareNativeEditorContent = (
   doc: TiptapDoc,
-  locale?: "zh-CN" | "en-US",
+  locale?: "zh-CN" | "en-US" | "ja",
 ): TiptapDoc => {
   const visit = (
     node: TiptapNode | TiptapTextNode,

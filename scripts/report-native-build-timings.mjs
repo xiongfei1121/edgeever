@@ -12,6 +12,16 @@ const TARGETS = {
       jobName: "macOS x64",
       packageSteps: ["Package desktop installer"],
     },
+    {
+      name: "Windows x64 Preview",
+      jobName: "Windows x64 unsigned Preview",
+      packageSteps: ["Package unsigned Windows installer"],
+    },
+    {
+      name: "Linux x64 Preview",
+      jobName: "Linux x64 AppImage Preview",
+      packageSteps: ["Package Linux AppImage"],
+    },
   ],
   android: [
     {

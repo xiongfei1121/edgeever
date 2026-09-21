@@ -7,10 +7,14 @@ import {
   AiProviderConnectionTestSchema,
   AiTagSuggestionPromptUpdateSchema,
   AiTagSuggestionsRequestSchema,
-  MAX_AI_TAG_SUGGESTIONS,
-  normalizeTags,
+  buildAiTagSuggestionRequest,
+  finalizeAiTagSuggestions,
   promptNeedsTargetLanguage,
   promptNeedsTone,
+  type AiAction,
+  type AiAttachmentInput,
+  type AiTargetLanguage,
+  type AiTone,
 } from "@edgeever/shared";
 import { zValidator } from "@hono/zod-validator";
 import type { Hono } from "hono";
@@ -30,9 +34,12 @@ import {
   getDefaultAiModelId,
   generateAiGeneration,
   generateAiTagSuggestions,
+  getDefaultAiDirectTarget,
   loadDefaultAiModel,
+  loadDefaultAiModelCredentials,
   normalizeAiGenerationText,
   normalizeAiBaseUrl,
+  prepareAiGeneration,
   resolvePrimaryAiCredentialEncryptionKey,
   streamAiGeneration,
   testAiModel,
@@ -61,6 +68,21 @@ const providerErrorMessage = (error: unknown) => {
   return error.message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").slice(0, 1000);
 };
 
+const validateAiGeneration = zValidator("json", AiGenerateSchema, (result, context) => {
+  if (result.success) return;
+  const sourceRequired = result.error.issues.some(
+    (issue) => issue.path[0] === "contentMarkdown" && issue.message === "Note content is required.",
+  );
+  return apiError(
+    context,
+    sourceRequired ? "ai_source_required" : "ai_request_invalid",
+    sourceRequired
+      ? "Note content is required for this AI action."
+      : "The AI request is invalid.",
+    400,
+  );
+});
+
 const encryptionConfigured = (context: AppContext) =>
   Boolean(resolvePrimaryAiCredentialEncryptionKey(context.env));
 
@@ -70,6 +92,7 @@ const readSettings = (context: AppContext, dependencies: AiRouteDependencies) =>
   encryptionConfigured(context),
   dependencies.isDemoMode(context.env),
   context.req.query("locale"),
+  context.env,
 );
 
 const denyMutation = (context: AppContext, dependencies: AiRouteDependencies) => {
@@ -111,6 +134,63 @@ const withAiError = (context: AppContext, error: unknown, fallbackCode: string) 
     return apiError(context, error.code, error.message, error.status);
   }
   return apiError(context, fallbackCode, providerErrorMessage(error), 400);
+};
+
+const resolveAiGenerateFields = async (context: AppContext, input: {
+  action: AiAction;
+  promptId?: string;
+  locale?: string;
+  instruction?: string;
+  targetLanguage?: AiTargetLanguage;
+  tone?: AiTone;
+  contentMarkdown: string;
+  attachments?: AiAttachmentInput[];
+}) => {
+  const workspaceId = getWorkspaceId(context);
+  const selectedPrompt = input.promptId
+    ? await getAiPromptTemplate(
+      context.env.storage.db,
+      workspaceId,
+      input.promptId,
+      input.locale,
+    )
+    : null;
+  if (input.promptId && !selectedPrompt) {
+    throw new AppError("ai_prompt_not_found", "The selected prompt no longer exists.", 404);
+  }
+
+  const action = selectedPrompt?.action ?? input.action;
+  const needsTargetLanguage = selectedPrompt
+    ? promptNeedsTargetLanguage(selectedPrompt.parameterKind)
+    : action === "translate";
+  const needsTone = selectedPrompt
+    ? promptNeedsTone(selectedPrompt.parameterKind)
+    : action === "change-tone";
+  if (needsTargetLanguage && !input.targetLanguage) {
+    throw new AppError("ai_target_language_required", "Choose a target language for this prompt.", 400);
+  }
+  if (needsTone && !input.tone) {
+    throw new AppError("ai_tone_required", "Choose a tone for this prompt.", 400);
+  }
+
+  const instruction = selectedPrompt?.instruction
+    || input.instruction?.trim()
+    || await resolveWorkspaceActionInstruction(
+      context.env.storage.db,
+      workspaceId,
+      action,
+      input.locale,
+    )
+    || undefined;
+
+  return {
+    action,
+    instruction,
+    targetLanguage: needsTargetLanguage ? input.targetLanguage : undefined,
+    tone: needsTone ? input.tone : undefined,
+    contentMarkdown: input.contentMarkdown,
+    attachments: input.attachments,
+  };
 };
 
 export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDependencies) => {
@@ -491,6 +571,49 @@ export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDepende
   );
 
   app.post(
+    "/api/v1/ai/tag-suggestions/prepare",
+    zValidator("json", AiTagSuggestionsRequestSchema),
+    async (context) => {
+      const denied = requireUser(context);
+      if (denied) return denied;
+      try {
+        const input = context.req.valid("json");
+        const workspaceId = getWorkspaceId(context);
+        const tagSummaries = await listTagSummaries(context.env.storage.db, workspaceId);
+        const allCanonicalTags = new Map(
+          tagSummaries.map((tag) => [tag.name.toLocaleLowerCase(), tag.name]),
+        );
+        const popularTags = [...tagSummaries]
+          .sort((left, right) => right.memoCount - left.memoCount || left.name.localeCompare(right.name))
+          .slice(0, 200)
+          .map((tag) => tag.name);
+        const existingTags = Array.from(new Set([
+          ...input.currentTags.map((tag) => allCanonicalTags.get(tag.toLocaleLowerCase()) ?? tag),
+          ...popularTags,
+        ]));
+        const credentials = await loadDefaultAiModelCredentials(
+          context.env.storage.db,
+          workspaceId,
+          context.env,
+        );
+        const fields = buildAiTagSuggestionRequest({
+          ...input,
+          existingTags,
+          instruction: await getAiTagSuggestionPrompt(context.env.storage.db, workspaceId, input.locale),
+        });
+        return context.json({
+          ...credentials,
+          ...fields,
+          currentTags: input.currentTags,
+          canonicalTags: Object.fromEntries(allCanonicalTags),
+        });
+      } catch (error) {
+        return withAiError(context, error, "ai_tag_suggestions_failed");
+      }
+    },
+  );
+
+  app.post(
     "/api/v1/ai/tag-suggestions",
     zValidator("json", AiTagSuggestionsRequestSchema),
     async (context) => {
@@ -511,6 +634,7 @@ export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDepende
           ...input.currentTags.map((tag) => allCanonicalTags.get(tag.toLocaleLowerCase()) ?? tag),
           ...popularTags,
         ]));
+        const canonicalTags = Object.fromEntries(allCanonicalTags);
         const rawSuggestions = dependencies.suggestTags
           ? await dependencies.suggestTags({ ...input, existingTags })
           : await generateAiTagSuggestions({
@@ -520,80 +644,69 @@ export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDepende
             model: await loadDefaultAiModel(context.env.storage.db, workspaceId, context.env),
             abortSignal: context.req.raw.signal,
           });
-        const currentTagKeys = new Set(input.currentTags.map((tag) => tag.toLocaleLowerCase()));
-        const suggestionNames = normalizeTags(
-          normalizeTags(rawSuggestions)
-            .filter((name) => !currentTagKeys.has(name.toLocaleLowerCase()))
-            .map((name) => allCanonicalTags.get(name.toLocaleLowerCase()) ?? name),
-        ).slice(0, MAX_AI_TAG_SUGGESTIONS);
-        const suggestions = suggestionNames
-          .map((name) => {
-            const canonicalName = allCanonicalTags.get(name.toLocaleLowerCase());
-            return { name: canonicalName ?? name, existing: Boolean(canonicalName) };
-          });
-        return context.json({ suggestions });
+        return context.json({ suggestions: finalizeAiTagSuggestions(rawSuggestions, input.currentTags, canonicalTags) });
       } catch (error) {
         return withAiError(context, error, "ai_tag_suggestions_failed");
       }
     },
   );
 
+  app.get(
+    "/api/v1/ai/direct-target",
+    async (context) => {
+      const denied = requireUser(context);
+      if (denied) return denied;
+      try {
+        return context.json(await getDefaultAiDirectTarget(
+          context.env.storage.db,
+          getWorkspaceId(context),
+          context.env,
+        ));
+      } catch (error) {
+        return withAiError(context, error, "ai_generation_failed");
+      }
+    },
+  );
+
   app.post(
-    "/api/v1/ai/generate",
-    zValidator("json", AiGenerateSchema),
+    "/api/v1/ai/generate/prepare",
+    validateAiGeneration,
     async (context) => {
       const denied = requireUser(context);
       if (denied) return denied;
       try {
         const input = context.req.valid("json");
-        const workspaceId = getWorkspaceId(context);
-        const selectedPrompt = input.promptId
-          ? await getAiPromptTemplate(
-            context.env.storage.db,
-            workspaceId,
-            input.promptId,
-            input.locale,
-          )
-          : null;
-        if (input.promptId && !selectedPrompt) {
-          throw new AppError("ai_prompt_not_found", "The selected prompt no longer exists.", 404);
-        }
+        const fields = await resolveAiGenerateFields(context, input);
+        const credentials = await loadDefaultAiModelCredentials(
+          context.env.storage.db,
+          getWorkspaceId(context),
+          context.env,
+        );
+        return context.json(prepareAiGeneration({ ...fields, credentials }));
+      } catch (error) {
+        return withAiError(context, error, "ai_generation_failed");
+      }
+    },
+  );
 
-        const action = selectedPrompt?.action ?? input.action;
-        const needsTargetLanguage = selectedPrompt
-          ? promptNeedsTargetLanguage(selectedPrompt.parameterKind)
-          : action === "translate";
-        const needsTone = selectedPrompt
-          ? promptNeedsTone(selectedPrompt.parameterKind)
-          : action === "change-tone";
-        if (needsTargetLanguage && !input.targetLanguage) {
-          throw new AppError("ai_target_language_required", "Choose a target language for this prompt.", 400);
-        }
-        if (needsTone && !input.tone) {
-          throw new AppError("ai_tone_required", "Choose a tone for this prompt.", 400);
-        }
-
-        const resolvedInstruction = selectedPrompt?.instruction
-          || input.instruction?.trim()
-          || await resolveWorkspaceActionInstruction(
-            context.env.storage.db,
-            workspaceId,
-            action,
-            input.locale,
-          )
-          || undefined;
+  app.post(
+    "/api/v1/ai/generate",
+    validateAiGeneration,
+    async (context) => {
+      const denied = requireUser(context);
+      if (denied) return denied;
+      try {
+        const input = context.req.valid("json");
+        const fields = await resolveAiGenerateFields(context, input);
         const model = await loadDefaultAiModel(
           context.env.storage.db,
-          workspaceId,
+          getWorkspaceId(context),
           context.env,
         );
         const resultBoundary = createAiGenerationResultBoundary();
         const generationInput = {
           ...input,
-          action,
-          instruction: resolvedInstruction,
-          targetLanguage: needsTargetLanguage ? input.targetLanguage : undefined,
-          tone: needsTone ? input.tone : undefined,
+          ...fields,
           model,
           resultBoundary,
           abortSignal: context.req.raw.signal,

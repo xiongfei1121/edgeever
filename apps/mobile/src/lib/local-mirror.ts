@@ -1,8 +1,15 @@
 import type { createEdgeEverClient, ListMemosResponse, MemoFilterMode, MemoSortMode } from "@edgeever/client";
-import type { MemoDetail, MemoSummary, Notebook, TagSummary } from "@edgeever/shared";
+import {
+  hasSyncStateReset,
+  isSyncMetadataInitialized,
+  splitSyncBootstrapWriteBatches,
+  type MemoDetail,
+  type MemoSummary,
+  type Notebook,
+  type TagSummary,
+} from "@edgeever/shared";
 import * as SQLite from "expo-sqlite";
-import { hasMobileSyncCursorRewound, hasMobileSyncIdentityChanged, isMobileSyncMetadataInitialized, splitMobileBootstrapWriteBatches } from "./mobile-sync-protocol";
-import { summarizeMobileTags } from "./mobile-tags";
+import { filterLocalMemosByExactTag, summarizeMobileTags } from "./mobile-tags";
 
 const DATABASE_NAME = "edgeever-mobile.db";
 const BOOTSTRAP_PAGE_SIZE = 200;
@@ -22,6 +29,7 @@ export type LocalMemoListParams = {
   notebookId?: string | null;
   notebookIds?: string[];
   q?: string;
+  tag?: string;
   trash?: boolean;
   sort?: MemoSortMode;
   filter?: MemoFilterMode;
@@ -50,7 +58,7 @@ export const isMobileLocalMirrorInitialized = async (scope: string) => {
   const metadata = new Map(rows.map((row) => [row.key, row.value]));
   const cursorValue = metadata.get("cursor");
   const identityValue = metadata.get("identity");
-  return isMobileSyncMetadataInitialized(cursorValue, identityValue);
+  return isSyncMetadataInitialized(cursorValue, identityValue);
 };
 
 export const listLocalNotebooks = async (scope: string): Promise<{ notebooks: Notebook[] }> => {
@@ -124,14 +132,40 @@ export const listLocalMemos = async (scope: string, params: LocalMemoListParams)
       : params.sort === "title-asc"
         ? "is_pinned DESC, title COLLATE NOCASE ASC, updated_at DESC, id DESC"
         : "is_pinned DESC, updated_at DESC, id DESC";
-  const countRow = await db.getFirstAsync<{ count: number }>(
-    `SELECT COUNT(*) AS count FROM mobile_memos WHERE ${conditions.join(" AND ")}`,
-    ...binds
-  );
+  const tag = params.tag?.trim() ?? "";
   const limit = params.limit ?? 50;
   const offset = Math.max(0, params.offset ?? 0);
+  const whereSql = conditions.join(" AND ");
+
+  if (tag) {
+    const rows = await db.getAllAsync<StoredMemoRow>(
+      `SELECT data_json FROM mobile_memos WHERE ${whereSql} ORDER BY ${orderBy}`,
+      ...binds
+    );
+    const memos = filterLocalMemosByExactTag(
+      rows.flatMap((row) => {
+        try {
+          return [toMemoSummary(JSON.parse(row.data_json) as MemoDetail)];
+        } catch {
+          return [];
+        }
+      }),
+      tag
+    );
+    const page = memos.slice(offset, offset + limit);
+    return {
+      memos: page,
+      totalCount: memos.length,
+      nextCursor: offset + page.length < memos.length ? String(offset + page.length) : null,
+    };
+  }
+
+  const countRow = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM mobile_memos WHERE ${whereSql}`,
+    ...binds
+  );
   const rows = await db.getAllAsync<StoredMemoRow>(
-    `SELECT data_json FROM mobile_memos WHERE ${conditions.join(" AND ")} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+    `SELECT data_json FROM mobile_memos WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
     ...binds,
     limit,
     offset
@@ -262,7 +296,7 @@ const performMobileLocalMirrorSync = async (
         snapshotCursor = page.snapshotCursor;
         snapshotIdentity = page.syncIdentity || "legacy";
       }
-      const writeBatches = splitMobileBootstrapWriteBatches(page.memos, BOOTSTRAP_WRITE_BATCH_SIZE);
+      const writeBatches = splitSyncBootstrapWriteBatches(page.memos, BOOTSTRAP_WRITE_BATCH_SIZE);
       for (const [batchIndex, memos] of writeBatches.entries()) {
         await db.withExclusiveTransactionAsync(async (tx) => {
           if (batchIndex === 0) {
@@ -290,7 +324,10 @@ const performMobileLocalMirrorSync = async (
 
   while (true) {
     const page = await client.getMobileSyncChanges(cursor, CHANGE_PAGE_SIZE);
-    if (hasMobileSyncCursorRewound(cursor, page.serverCursor) || hasMobileSyncIdentityChanged(syncIdentity, page.syncIdentity)) {
+    if (hasSyncStateReset(
+      { cursor, syncIdentity },
+      { serverCursor: page.serverCursor, syncIdentity: page.syncIdentity },
+    )) {
       // A restored/replaced server database can legitimately restart its
       // change sequence. Rebuild the mirror instead of treating the stale
       // local cursor as proof that no remote notes exist.

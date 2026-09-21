@@ -1,4 +1,5 @@
 import { DEFAULT_MEMO_TITLE, type MemoSummary, type Notebook } from "@edgeever/shared";
+import { resolveSupportedLocale } from "@edgeever/shared/i18n/locales";
 import type { MobileLocalePreference } from "../lib/preferences";
 
 export type NotebookOption = {
@@ -113,10 +114,12 @@ export const filterCollapsedNotebookOptions = (options: NotebookOption[], collap
 };
 
 export const getResolvedMobileLocale = (localePreference: MobileLocalePreference) =>
-  localePreference === "system" ? Intl.DateTimeFormat().resolvedOptions().locale || "zh-CN" : localePreference;
+  localePreference === "system"
+    ? resolveSupportedLocale(Intl.DateTimeFormat().resolvedOptions().locale)
+    : localePreference;
 
 export const isEnglishMobileLocale = (localePreference: MobileLocalePreference) =>
-  getResolvedMobileLocale(localePreference).startsWith("en");
+  getResolvedMobileLocale(localePreference) !== "zh-CN";
 
 export const formatDate = (value: string, localePreference: MobileLocalePreference = "system") =>
   new Intl.DateTimeFormat(getResolvedMobileLocale(localePreference), {
@@ -139,9 +142,25 @@ export const formatMemoPreviewDate = (value: string, localePreference: MobileLoc
     return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date);
   }
   if (memoDay === today - 24 * 60 * 60 * 1000) {
-    return isEnglishMobileLocale(localePreference) ? "Yesterday" : "昨天";
+    if (locale === "ja") return "昨日";
+    if (locale === "en-US") return "Yesterday";
+    return "昨天";
   }
   return new Intl.DateTimeFormat(locale, { year: "numeric", month: "numeric", day: "numeric" }).format(date);
+};
+
+export const formatMemoDetailDate = (value: string, locale: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat(locale, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 };
 
 export const sortMemoSummaries = (memos: MemoSummary[], sortMode: unknown) =>

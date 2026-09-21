@@ -19,7 +19,6 @@ describe("native release planning", () => {
       "packages/shared/src/index.ts",
       "bun.lock",
       "scripts/build-android-local.sh",
-      "scripts/configure-android-package-permissions.mjs",
       "scripts/verify-android-apk-signature.mjs",
       ".github/workflows/mobile-build.yml",
       ".github/workflows/android-play-signature-audit.yml",
@@ -37,7 +36,7 @@ describe("native release planning", () => {
       "package.json",
       "bun.lock",
       "apps/mobile/app.json",
-      "patches/expo-sharing@57.0.8.patch",
+      "patches/expo-sharing@57.0.16.patch",
       "scripts/plan-native-release.mjs",
       "scripts/plan-native-release.test.mjs",
     ];
@@ -47,7 +46,7 @@ describe("native release planning", () => {
       relevantChanges: [
         "bun.lock",
         "apps/mobile/app.json",
-        "patches/expo-sharing@57.0.8.patch",
+        "patches/expo-sharing@57.0.16.patch",
       ],
     });
     expect(planNativeRelease("desktop", changedFiles)).toEqual({
@@ -70,11 +69,19 @@ describe("native release planning", () => {
 
   test("rebuilds desktop when its architecture packaging pipeline changes", () => {
     const changedFiles = [
+      ".cargo/config.toml",
       ".github/workflows/desktop-build.yml",
       "scripts/create-mac-update-metadata.mjs",
+      "scripts/create-windows-update-metadata.mjs",
       "scripts/prepare-desktop-icons.mjs",
       "scripts/desktop-icns.mjs",
+      "scripts/pe-imports.mjs",
       "scripts/run-desktop-builder.mjs",
+      "scripts/sign-windows-update-manifest.mjs",
+      "scripts/verify-windows-update-release.mjs",
+      "scripts/verify-desktop-cross-version-startup.mjs",
+      "scripts/verify-packaged-desktop-startup.mjs",
+      "scripts/verify-renderer-origin-migration.mjs",
     ];
     expect(planNativeRelease("desktop", changedFiles)).toEqual({
       rebuild: true,
@@ -86,5 +93,43 @@ describe("native release planning", () => {
     expect(
       planNativeRelease("desktop", ["package.json", "release-summary.json", "AGENTS.md"]),
     ).toEqual({ rebuild: false, relevantChanges: [] });
+  });
+
+  test("rebuilds iOS for the native client or shared editor runtime", () => {
+    expect(
+      planNativeRelease("ios", [
+        "apps/ios/EdgeEver/App/RootView.swift",
+        "packages/shared/src/index.ts",
+        "apps/mobile/src/screens/LoginScreen.tsx",
+      ]),
+    ).toEqual({
+      rebuild: true,
+      relevantChanges: [
+        "apps/ios/EdgeEver/App/RootView.swift",
+        "packages/shared/src/index.ts",
+      ],
+    });
+  });
+
+  test("does not rebuild iOS for Android-only or documentation changes", () => {
+    expect(
+      planNativeRelease("ios", [
+        "apps/mobile/src/screens/LoginScreen.tsx",
+        "apps/ios/README.md",
+        "package.json",
+      ]),
+    ).toEqual({ rebuild: false, relevantChanges: [] });
+  });
+
+  test("rebuilds desktop when bundled sidecar migrations change", () => {
+    expect(
+      planNativeRelease("desktop", [
+        "migrations/0053_collapse_duplicate_inbox_notebooks.sql",
+        "apps/api/src/notebook-service.test.mjs",
+      ]),
+    ).toEqual({
+      rebuild: true,
+      relevantChanges: ["migrations/0053_collapse_duplicate_inbox_notebooks.sql"],
+    });
   });
 });

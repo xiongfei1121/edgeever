@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import Lightbox from "yet-another-react-lightbox";
 import Zoom from "yet-another-react-lightbox/plugins/zoom";
@@ -18,6 +18,7 @@ import {
   List,
   X,
   Loader2,
+  Trash2,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,8 @@ import { isPdfAttachment, type ResourceListItem } from "@edgeever/shared";
 import { PdfViewer } from "@/components/pdf/PdfViewer";
 import { PdfThumbnail } from "@/components/pdf/PdfThumbnail";
 import { AttachmentFileIcon } from "@/components/attachments/AttachmentFileIcon";
+import { AppConfirmDialog } from "@/components/dialogs/ConfirmDialogs";
+import { ExecutionCenterButton } from "@/components/execution/ExecutionCenterButton";
 
 export const formatBytes = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -62,10 +65,12 @@ const DOCUMENT_MIME_TYPES = new Set([
 interface AssetsPaneProps {
   onClose: () => void;
   repository: EdgeEverRepository;
+  onOpenExecutionCenter: () => void;
 }
 
-export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
+export const AssetsPane = ({ onClose, repository, onOpenExecutionCenter }: AssetsPaneProps) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
 
   // States
   const [searchQuery, setSearchQuery] = useState("");
@@ -75,6 +80,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
   });
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [pdfPreview, setPdfPreview] = useState<ResourceListItem | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ResourceListItem | null>(null);
 
   // Query resources
   const resourcesQuery = useQuery({
@@ -88,6 +94,19 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
     totalBytes: 0,
     imageCount: 0,
     attachmentCount: 0,
+  };
+
+  const deleteMutation = useMutation({
+    mutationFn: (resourceId: string) => repository.deleteResource(resourceId),
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await queryClient.invalidateQueries({ queryKey: ["resources"] });
+    },
+  });
+
+  const requestResourceDelete = (resource: ResourceListItem) => {
+    deleteMutation.reset();
+    setDeleteTarget(resource);
   };
 
   // Filter Logic
@@ -170,7 +189,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
     resource.memoDeleted ? t("assets.deletedMemo") : resource.memoTitle || resource.memoExcerpt || resource.memoId;
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col bg-white select-none outline-none">
+    <div className="relative flex h-full min-h-0 flex-col bg-card select-none outline-none">
 
       {/* Header */}
       <header className="flex h-[calc(4rem+env(safe-area-inset-top))] shrink-0 items-end justify-between border-b border-slate-200 px-6 pb-3 pt-[env(safe-area-inset-top)] lg:h-16 lg:items-center lg:pb-0 lg:pt-0">
@@ -203,10 +222,11 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
             </p>
           </div>
         </div>
+        <ExecutionCenterButton onClick={onOpenExecutionCenter} />
       </header>
 
       {/* Toolbar (Filters, Search, Layout mode) */}
-      <div className="shrink-0 border-b border-slate-100 bg-white p-4">
+      <div className="shrink-0 border-b border-slate-100 bg-card p-4">
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           {/* Category Filters */}
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0 scrollbar-none">
@@ -236,7 +256,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                 aria-label={t("assets.searchPlaceholder")}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="h-9 w-full rounded-lg border border-slate-200 bg-slate-50/50 pl-9 pr-8 text-xs text-slate-800 placeholder-slate-400 transition-colors focus:border-emerald-500/50 focus:bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500/20"
+                className="h-9 w-full rounded-lg border border-slate-200 bg-slate-50/50 pl-9 pr-8 text-xs text-slate-800 placeholder-slate-400 transition-colors focus:border-emerald-500/50 focus:bg-card focus:outline-none focus:ring-1 focus:ring-emerald-500/20"
               />
               {searchQuery && (
                 <button
@@ -256,7 +276,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                   aria-label={t("assets.gridView")}
                   aria-pressed={layoutMode === "grid"}
                   className={`flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
-                    layoutMode === "grid" ? "bg-white text-emerald-700 shadow-sm" : "text-slate-400 hover:text-slate-600"
+                    layoutMode === "grid" ? "bg-card text-emerald-700 shadow-sm" : "text-slate-400 hover:text-slate-600"
                   }`}
                 >
                   <Grid className="h-4 w-4" />
@@ -268,7 +288,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                   aria-label={t("assets.listView")}
                   aria-pressed={layoutMode === "list"}
                   className={`flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
-                    layoutMode === "list" ? "bg-white text-emerald-700 shadow-sm" : "text-slate-400 hover:text-slate-600"
+                    layoutMode === "list" ? "bg-card text-emerald-700 shadow-sm" : "text-slate-400 hover:text-slate-600"
                   }`}
                 >
                   <List className="h-4 w-4" />
@@ -288,7 +308,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
               <span className="text-xs font-medium">{t("assets.loading")}</span>
             </div>
           ) : filteredResources.length === 0 ? (
-            <div className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-white px-6 py-24 text-center">
+            <div className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-card px-6 py-24 text-center">
               <Archive className="h-10 w-10 text-slate-350 mb-3 stroke-[1.5]" />
               <p className="text-sm font-semibold text-slate-500">
                 {searchQuery || filterType !== "all" ? t("assets.noMatches") : t("assets.empty")}
@@ -305,8 +325,20 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
               {filteredResources.map((resource) => (
                 <div
                   key={resource.id}
-                  className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition-all duration-200 hover:border-emerald-500/40 hover:shadow-md"
+                  className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-card shadow-sm transition-all duration-200 hover:border-emerald-500/40 hover:shadow-md"
                 >
+                  <ButtonTooltip title={t("assets.deleteAria", { filename: resource.filename || resource.id })}>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label={t("assets.deleteAria", { filename: resource.filename || resource.id })}
+                      className="absolute right-2 top-2 z-10 h-8 w-8 bg-card/90 text-slate-500 opacity-0 shadow-sm transition-opacity hover:bg-rose-50 hover:text-rose-600 focus:opacity-100 group-hover:opacity-100"
+                      onClick={() => requestResourceDelete(resource)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </ButtonTooltip>
                   {/* Thumbnail area */}
                   <div
                     role="button"
@@ -345,7 +377,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                     )}
                     {/* Hover detail overlay */}
                     <div className="absolute inset-0 bg-slate-900/40 opacity-0 transition-opacity duration-200 group-hover:opacity-100 flex items-center justify-center">
-                      <span className="rounded bg-white/90 px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 shadow flex items-center gap-1">
+                      <span className="rounded bg-card/90 px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 shadow flex items-center gap-1">
                         {resource.kind === "image"
                           ? t("assets.previewImage")
                           : isPdfAttachment(resource.mimeType, resource.filename)
@@ -386,7 +418,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
               {filteredResources.map((resource) => (
                 <div
                   key={resource.id}
-                  className="group relative flex items-center gap-3.5 rounded-xl border border-slate-200/80 bg-white p-3.5 text-left transition-all duration-200 hover:border-emerald-500/35 hover:shadow-sm"
+                  className="group relative flex items-center gap-3.5 rounded-xl border border-slate-200/80 bg-card p-3.5 text-left transition-all duration-200 hover:border-emerald-500/35 hover:shadow-sm"
                 >
                   {/* Left Icon/Thumbnail */}
                   <div
@@ -436,6 +468,18 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                   </div>
 
                   {/* Right Actions */}
+                  <ButtonTooltip title={t("assets.deleteAria", { filename: resource.filename || resource.id })}>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label={t("assets.deleteAria", { filename: resource.filename || resource.id })}
+                      className="h-8 w-8 text-slate-350 opacity-0 transition-all duration-150 hover:bg-rose-50 hover:text-rose-600 focus:opacity-100 group-hover:opacity-100"
+                      onClick={() => requestResourceDelete(resource)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </ButtonTooltip>
                   <ButtonTooltip title={t("assets.openInNewWindow")}>
                     <a
                       href={resource.url}
@@ -475,6 +519,20 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
           onRequestClose={() => setPdfPreview(null)}
           onPrevious={pdfResources.length > 1 ? showPreviousPdf : undefined}
           onNext={pdfResources.length > 1 ? showNextPdf : undefined}
+        />
+      ) : null}
+      {deleteTarget ? (
+        <AppConfirmDialog
+          title={t("assets.deleteTitle")}
+          description={t("assets.deleteDescription")}
+          confirmLabel={t("common.delete")}
+          error={deleteMutation.error instanceof Error ? deleteMutation.error.message : null}
+          isWorking={deleteMutation.isPending}
+          onCancel={() => {
+            deleteMutation.reset();
+            setDeleteTarget(null);
+          }}
+          onConfirm={() => deleteMutation.mutate(deleteTarget.id)}
         />
       ) : null}
     </div>

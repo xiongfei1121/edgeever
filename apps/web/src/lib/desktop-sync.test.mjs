@@ -1,15 +1,25 @@
 import { describe, expect, test } from "bun:test";
 
 const {
+  classifyDesktopSyncFailure,
+  createDesktopSyncIssueDetails,
+  createDesktopSyncDiagnosticText,
+  createDesktopSyncSummary,
   isStagedResourceReferenced,
   hasDesktopSyncStateReset,
   mergeMemoIdMappings,
   mergeSyncedMemos,
   normalizeDesktopMemoPayload,
   orderBootstrapNotebooks,
+  orderDesktopSyncChanges,
   resolveDesktopMemoSyncBase,
+  resolveDesktopStaleMemoUpdate,
+  desktopLocalRevisionWitnessesRemote,
   rewriteStagedResource,
+  shouldAttemptDesktopRecoveryPull,
+  shouldPullDesktopChanges,
 } = await import("./desktop-sync.ts");
+const { ApiRequestError } = await import("./api.ts");
 
 describe("desktop staged resource sync", () => {
   test("rewrites placeholders in memo JSON and markdown", () => {
@@ -95,6 +105,30 @@ describe("desktop bootstrap sync", () => {
       "grandchild",
     ]);
   });
+
+  test("applies notebook upserts before memos in an incremental change page", () => {
+    const memo = { entityType: "memo", entityId: "memo-1", operation: "upsert", notebook: null };
+    const child = {
+      entityType: "notebook",
+      entityId: "child",
+      operation: "upsert",
+      notebook: { id: "child", parentId: "parent" },
+    };
+    const parent = {
+      entityType: "notebook",
+      entityId: "parent",
+      operation: "upsert",
+      notebook: { id: "parent", parentId: null },
+    };
+    const deleted = { entityType: "notebook", entityId: "gone", operation: "delete", notebook: null };
+
+    expect(orderDesktopSyncChanges([memo, child, deleted, parent]).map((change) => change.entityId)).toEqual([
+      "parent",
+      "child",
+      "gone",
+      "memo-1",
+    ]);
+  });
 });
 
 describe("desktop memo sync base", () => {
@@ -110,5 +144,182 @@ describe("desktop memo sync base", () => {
       { revision: 9, contentHash: "cloud-9" },
       { expectedRevision: 3, expectedContentHash: "cloud-3" },
     )).toEqual({ expectedRevision: 3, expectedContentHash: "cloud-3" });
+  });
+
+  test("acks a lost save when the cloud already has the queued payload", () => {
+    expect(resolveDesktopStaleMemoUpdate({
+      current: { revision: 10, contentHash: "hash-a" },
+      expected: { expectedRevision: 9, expectedContentHash: "hash-before" },
+      payload: { title: "", tags: [], contentMarkdown: "一期验收通过。", contentJson: { type: "doc" } },
+      remote: { title: "无标题笔记", tags: [], contentMarkdown: "一期验收通过。", contentHash: "hash-a", contentJson: { type: "doc" } },
+      localRevisions: [],
+    })).toBe("ack");
+  });
+
+  test("rebases a later local draft when a sidecar snapshot already contains the cloud body", () => {
+    const remote = {
+      title: "无标题笔记",
+      tags: [],
+      contentMarkdown: "一期验收通过。",
+      contentHash: "hash-a",
+      contentJson: { type: "doc", content: [{ type: "paragraph" }] },
+    };
+
+    expect(desktopLocalRevisionWitnessesRemote([
+      {
+        id: "revision_local_1",
+        revision: 9,
+        contentHash: "sidecar-a",
+        contentMarkdown: "一期验收通过。",
+        contentJson: remote.contentJson,
+      },
+    ], remote, 9)).toBe(true);
+
+    expect(resolveDesktopStaleMemoUpdate({
+      current: { revision: 10, contentHash: "hash-a" },
+      expected: { expectedRevision: 9, expectedContentHash: "hash-before" },
+      payload: { title: "", tags: [], contentMarkdown: "一期验收通过。然后继续写。", contentJson: { type: "doc" } },
+      remote,
+      localRevisions: [{
+        id: "revision_local_1",
+        revision: 9,
+        contentHash: "sidecar-a",
+        contentMarkdown: "一期验收通过。",
+        contentJson: remote.contentJson,
+      }],
+    })).toBe("rebase");
+  });
+
+  test("does not treat an older local snapshot or a remote-cached revision as proof", () => {
+    const remote = {
+      title: "无标题笔记",
+      tags: [],
+      contentMarkdown: "别人改过的正文",
+      contentHash: "hash-other",
+      contentJson: { type: "doc" },
+    };
+
+    expect(desktopLocalRevisionWitnessesRemote([
+      {
+        id: "revision_local_old",
+        revision: 3,
+        contentHash: "hash-other",
+        contentMarkdown: "别人改过的正文",
+        contentJson: remote.contentJson,
+      },
+      {
+        id: "rev_remote_cached",
+        revision: 10,
+        contentHash: "hash-other",
+        contentMarkdown: "别人改过的正文",
+        contentJson: remote.contentJson,
+      },
+    ], remote, 9)).toBe(false);
+
+    expect(resolveDesktopStaleMemoUpdate({
+      current: { revision: 10, contentHash: "hash-other" },
+      expected: { expectedRevision: 9, expectedContentHash: "hash-before" },
+      payload: { title: "", tags: [], contentMarkdown: "本地还在写的草稿", contentJson: { type: "doc" } },
+      remote,
+      localRevisions: [{
+        id: "revision_local_9",
+        revision: 9,
+        contentHash: "sidecar-local",
+        contentMarkdown: "本地还在写的草稿",
+        contentJson: { type: "doc" },
+      }],
+    })).toBe("conflict");
+  });
+});
+
+describe("desktop sync failure handling", () => {
+  test("stops retrying a missing memo update and keeps transient failures retryable", () => {
+    expect(classifyDesktopSyncFailure(
+      { kind: "memo.update" },
+      new ApiRequestError("Memo not found", 404, "not_found"),
+    )).toEqual({ conflict: false, retryable: false, errorCode: "memo_not_found" });
+
+    expect(classifyDesktopSyncFailure(
+      { kind: "memo.update" },
+      new ApiRequestError("Temporarily unavailable", 503),
+    )).toEqual({ conflict: false, retryable: true, errorCode: "http_503" });
+  });
+
+  test("copies diagnostics without exposing entity ids or payload content", () => {
+    const diagnostic = createDesktopSyncDiagnosticText([{
+      id: 7,
+      kind: "memo.update",
+      entityId: "private-memo-id",
+      payload: { contentMarkdown: "private note body" },
+      attemptCount: 3,
+      version: 1,
+      status: "error",
+      lastError: "Memo memo_private123 not found at https://private.example.test/api",
+      lastErrorCode: "memo_not_found",
+      retryable: false,
+    }]);
+
+    expect(diagnostic).toContain("memo_not_found");
+    expect(diagnostic).toContain('"totalItemCount": 1');
+    expect(diagnostic).not.toContain('"id": 7');
+    expect(diagnostic).not.toContain("private-memo-id");
+    expect(diagnostic).not.toContain("private note body");
+    expect(diagnostic).not.toContain("memo_private123");
+    expect(diagnostic).not.toContain("private.example.test");
+  });
+
+  test("keeps a global failure visible in both the summary and details", () => {
+    const globalIssue = {
+      phase: "pull_remote_changes",
+      message: "Request failed at https://private.example.test/api/v1/sync/changes",
+      errorCode: "http_500",
+      occurredAt: "2026-09-05T00:00:00.000Z",
+    };
+
+    expect(createDesktopSyncSummary({ pending: 0, syncing: 0, conflict: 0, error: 0 }, globalIssue)).toEqual({
+      total: 1,
+      pending: 0,
+      syncing: 0,
+      conflict: 0,
+      error: 1,
+    });
+    expect(createDesktopSyncIssueDetails([], globalIssue)).toEqual({ globalIssue, items: [] });
+    expect(createDesktopSyncDiagnosticText([], globalIssue)).toContain("pull_remote_changes");
+    expect(createDesktopSyncDiagnosticText([], globalIssue)).not.toContain("private.example.test");
+  });
+
+  test("bounds diagnostics for a prefilled GitHub Issue URL", () => {
+    const items = Array.from({ length: 200 }, (_, id) => ({
+      id,
+      kind: "memo.update",
+      entityId: `memo_private_${id}`,
+      payload: { contentMarkdown: "private note body" },
+      attemptCount: 99_999,
+      version: 1,
+      status: "error",
+      lastError: "Temporary failure ".repeat(40),
+      lastErrorCode: "network_error",
+      retryable: true,
+    }));
+    const diagnostic = createDesktopSyncDiagnosticText(items);
+
+    expect(diagnostic).toContain('"totalItemCount": 200');
+    expect(diagnostic).toContain('"includedItemCount": 5');
+    expect(encodeURIComponent(diagnostic).length).toBeLessThan(6_000);
+  });
+
+  test("allows remote pulls while durable errors are handled separately", () => {
+    expect(shouldPullDesktopChanges({ pending: 0, syncing: 0, error: 1, conflict: 1 }, true)).toBe(true);
+    expect(shouldPullDesktopChanges({ pending: 1, syncing: 0, error: 0, conflict: 0 }, true)).toBe(false);
+    expect(shouldPullDesktopChanges({ pending: 0, syncing: 0, error: 0, conflict: 0 }, false)).toBe(false);
+  });
+
+  test("attempts a recovery pull only when no local upload can be overwritten", () => {
+    expect(shouldAttemptDesktopRecoveryPull("sync_staged_resources", { pending: 0, syncing: 0 }, true)).toBe(true);
+    expect(shouldAttemptDesktopRecoveryPull("sync_staged_resources", { pending: 1, syncing: 0 }, true)).toBe(false);
+    expect(shouldAttemptDesktopRecoveryPull("sync_staged_resources", { pending: 0, syncing: 1 }, true)).toBe(false);
+    expect(shouldAttemptDesktopRecoveryPull("pull_remote_changes", { pending: 0, syncing: 0 }, true)).toBe(false);
+    expect(shouldAttemptDesktopRecoveryPull("finalize_resource_remap", { pending: 0, syncing: 0 }, true)).toBe(false);
+    expect(shouldAttemptDesktopRecoveryPull("sync_staged_resources", { pending: 0, syncing: 0 }, false)).toBe(false);
   });
 });

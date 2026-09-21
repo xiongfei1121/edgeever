@@ -31,6 +31,16 @@ actor APIClient {
         onUnauthorized = handler
     }
 
+    // MARK: - Instance diagnostics
+
+    func getInstanceHealth() async throws -> InstanceHealth {
+        try await request(path: "/api/health")
+    }
+
+    func getInstanceRelease() async throws -> InstanceRelease {
+        try await request(path: "/api/release")
+    }
+
     // MARK: - Auth
 
     func login(_ input: LoginInput) async throws -> AuthSession {
@@ -204,51 +214,33 @@ actor APIClient {
     }
 
     func streamAiGeneration(_ input: AiGenerateInput) -> AsyncThrowingStream<AiStreamEvent, Error> {
-        var request = URLRequest(url: makeURL(path: "/api/v1/ai/generate"))
-        request.httpMethod = "POST"
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        let encodedBody: Data
-        do {
-            encodedBody = try EdgeEverJSON.encoder.encode(input)
-        } catch {
-            return AsyncThrowingStream { continuation in continuation.finish(throwing: error) }
-        }
-        request.httpBody = encodedBody
-        let streamRequest = request
         let session = self.session
         let unauthorized = onUnauthorized
-
+        let sessionToken = token
+        let generateURL = makeURL(path: "/api/v1/ai/generate")
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await session.bytes(for: streamRequest)
-                    guard let http = response as? HTTPURLResponse else {
-                        throw APIError(status: -1, code: nil, message: "Invalid response")
-                    }
-                    if http.statusCode == 401 {
-                        unauthorized?()
-                    }
-                    guard (200 ..< 300).contains(http.statusCode) else {
-                        var data = Data()
-                        for try await byte in bytes { data.append(byte) }
-                        let message = Self.parseErrorMessage(data: data)
-                            ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
-                        throw APIError(
-                            status: http.statusCode,
-                            code: Self.parseErrorCode(data: data),
-                            message: message
+                    do {
+                        let prepared: AiPreparedGeneration = try await self.request(
+                            path: "/api/v1/ai/generate/prepare",
+                            method: "POST",
+                            body: input
                         )
-                    }
-                    for try await line in bytes.lines {
-                        try Task.checkCancellation()
-                        guard line.hasPrefix("data: ") else { continue }
-                        let payload = String(line.dropFirst(6))
-                        guard let data = payload.data(using: .utf8) else { continue }
-                        continuation.yield(try EdgeEverJSON.decoder.decode(AiStreamEvent.self, from: data))
+                        try await Self.streamDirectProvider(
+                            prepared,
+                            session: session,
+                            continuation: continuation
+                        )
+                    } catch let apiError as APIError where apiError.status == 404 {
+                        try await Self.streamEdgeEverGenerate(
+                            input: input,
+                            url: generateURL,
+                            token: sessionToken,
+                            session: session,
+                            unauthorized: unauthorized,
+                            continuation: continuation
+                        )
                     }
                     continuation.finish()
                 } catch {
@@ -256,6 +248,99 @@ actor APIClient {
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private static func streamDirectProvider(
+        _ prepared: AiPreparedGeneration,
+        session: URLSession,
+        continuation: AsyncThrowingStream<AiStreamEvent, Error>.Continuation
+    ) async throws {
+        let request = try AiDirectStream.providerRequest(for: prepared)
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(status: -1, code: nil, message: "Invalid response")
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            var data = Data()
+            for try await byte in bytes { data.append(byte) }
+            let raw = String(data: data, encoding: .utf8) ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+            throw APIError(status: http.statusCode, code: "ai_generation_failed", message: String(raw.prefix(1000)))
+        }
+        continuation.yield(AiStreamEvent(type: "start", text: nil, code: nil, message: nil, finishReason: nil, inputTokens: nil, outputTokens: nil))
+        let normalizer = AiGenerationStreamNormalizer(resultBoundary: prepared.resultBoundary)
+        var hasContent = false
+        var finishReason: String?
+        var inputTokens: Int?
+        var outputTokens: Int?
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload.isEmpty || payload == "[DONE]" { continue }
+            guard let data = payload.data(using: .utf8),
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let delta = AiDirectStream.extractDelta(provider: prepared.provider, payload: json)
+            if let reason = delta.finishReason { finishReason = reason }
+            if let tokens = delta.inputTokens { inputTokens = tokens }
+            if let tokens = delta.outputTokens { outputTokens = tokens }
+            let text = normalizer.push(delta.text)
+            if text.isEmpty { continue }
+            hasContent = hasContent || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            continuation.yield(AiStreamEvent(type: "text-delta", text: text, code: nil, message: nil, finishReason: nil, inputTokens: nil, outputTokens: nil))
+        }
+        let trailing = normalizer.finish()
+        if !trailing.isEmpty {
+            hasContent = hasContent || !trailing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            continuation.yield(AiStreamEvent(type: "text-delta", text: trailing, code: nil, message: nil, finishReason: nil, inputTokens: nil, outputTokens: nil))
+        }
+        if !hasContent {
+            continuation.yield(AiStreamEvent(type: "error", text: nil, code: "ai_generation_failed", message: "The AI did not return a note result.", finishReason: nil, inputTokens: nil, outputTokens: nil))
+            return
+        }
+        continuation.yield(AiStreamEvent(type: "finish", text: nil, code: nil, message: nil, finishReason: finishReason, inputTokens: inputTokens, outputTokens: outputTokens))
+    }
+
+    private static func streamEdgeEverGenerate(
+        input: AiGenerateInput,
+        url: URL,
+        token: String?,
+        session: URLSession,
+        unauthorized: (@Sendable () -> Void)?,
+        continuation: AsyncThrowingStream<AiStreamEvent, Error>.Continuation
+    ) async throws {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try EdgeEverJSON.encoder.encode(input)
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(status: -1, code: nil, message: "Invalid response")
+        }
+        if http.statusCode == 401 {
+            unauthorized?()
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            var data = Data()
+            for try await byte in bytes { data.append(byte) }
+            let message = Self.parseErrorMessage(data: data)
+                ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+            throw APIError(
+                status: http.statusCode,
+                code: Self.parseErrorCode(data: data),
+                message: message
+            )
+        }
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data: ") else { continue }
+            let payload = String(line.dropFirst(6))
+            guard let data = payload.data(using: .utf8) else { continue }
+            continuation.yield(try EdgeEverJSON.decoder.decode(AiStreamEvent.self, from: data))
         }
     }
 
@@ -281,22 +366,107 @@ actor APIClient {
     // MARK: - Resources / tokens / tags
 
     func uploadMemoResource(memoId: String, filename: String, mimeType: String, data: Data) async throws -> Resource {
-        let boundary = "EdgeEverBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-        var body = Data()
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
-        body.append(data)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        try await uploadMemoResourceParts(
+            memoId: memoId,
+            filename: filename,
+            mimeType: mimeType,
+            byteSize: data.count,
+            readPart: { range in data.subdata(in: range) }
+        )
+    }
 
-        var request = URLRequest(url: makeURL(path: "/api/v1/memos/\(memoId)/resources"))
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        if let token {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    /// Upload a file without retaining the complete attachment in process memory.
+    /// The file handle reads only the server-advertised multipart chunk for each request.
+    func uploadMemoResource(memoId: String, filename: String, mimeType: String, fileURL: URL) async throws -> Resource {
+        let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard values.isRegularFile == true, let byteSize = values.fileSize, byteSize > 0 else {
+            throw APIError(status: 0, code: nil, message: "Attachment file is unavailable")
         }
-        request.httpBody = body
-        return try await perform(request).resource
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        return try await uploadMemoResourceParts(
+            memoId: memoId,
+            filename: filename,
+            mimeType: mimeType,
+            byteSize: byteSize,
+            readPart: { range in
+                try handle.seek(toOffset: UInt64(range.lowerBound))
+                let data = try handle.read(upToCount: range.count) ?? Data()
+                guard data.count == range.count else {
+                    throw APIError(status: 0, code: nil, message: "Attachment file changed while uploading")
+                }
+                return data
+            }
+        )
+    }
+
+    private func uploadMemoResourceParts(
+        memoId: String,
+        filename: String,
+        mimeType: String,
+        byteSize: Int,
+        readPart: (Range<Int>) throws -> Data
+    ) async throws -> Resource {
+        struct StartBody: Encodable {
+            var filename: String
+            var mimeType: String
+            var byteSize: Int
+        }
+        struct Upload: Decodable {
+            var id: String
+            var partSize: Int
+            var partCount: Int
+        }
+        struct StartResponse: Decodable { var upload: Upload }
+
+        let started: StartResponse = try await request(
+            path: "/api/v1/memos/\(memoId)/resource-uploads",
+            method: "POST",
+            body: StartBody(filename: filename, mimeType: mimeType, byteSize: byteSize)
+        )
+
+        do {
+            for partNumber in 1 ... started.upload.partCount {
+                let start = (partNumber - 1) * started.upload.partSize
+                let end = min(start + started.upload.partSize, byteSize)
+                let chunk = try readPart(start ..< end)
+                var attempt = 0
+                while true {
+                    do {
+                        var partRequest = URLRequest(
+                            url: makeURL(path: "/api/v1/resource-uploads/\(started.upload.id)/parts/\(partNumber)")
+                        )
+                        partRequest.httpMethod = "PUT"
+                        partRequest.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+                        partRequest.setValue(String(chunk.count), forHTTPHeaderField: "Content-Length")
+                        if let token {
+                            partRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                        }
+                        partRequest.httpBody = chunk
+                        _ = try await performRaw(partRequest)
+                        break
+                    } catch {
+                        attempt += 1
+                        let retryable = !(error is APIError)
+                            || ((error as? APIError).map { $0.status == 408 || $0.status == 429 || $0.status >= 500 } ?? false)
+                        if !retryable || attempt >= 3 { throw error }
+                        try await Task.sleep(for: .milliseconds(attempt * 250))
+                    }
+                }
+            }
+            let completed: ResourceResponse = try await request(
+                path: "/api/v1/resource-uploads/\(started.upload.id)/complete",
+                method: "POST",
+                body: EmptyBody()
+            )
+            return completed.resource
+        } catch {
+            let _: OkResponse? = try? await request(
+                path: "/api/v1/resource-uploads/\(started.upload.id)",
+                method: "DELETE"
+            )
+            throw error
+        }
     }
 
     /// Fetch a resource path (usually `/api/v1/resources/:id/blob`) with session auth.
@@ -321,6 +491,45 @@ actor APIClient {
         let mimeType = header.split(separator: ";").first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
             ?? "application/octet-stream"
         return (data, mimeType)
+    }
+
+    /// Download a protected resource directly to a temporary file without retaining
+    /// the complete response body in process memory.
+    func downloadResourceFile(path: String, suggestedFilename: String) async throws -> URL {
+        var request = URLRequest(url: makeURL(path: path))
+        request.httpMethod = "GET"
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (temporaryURL, response) = try await session.download(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError(status: -1, code: nil, message: "Invalid response")
+        }
+        if http.statusCode == 401 {
+            onUnauthorized?()
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            throw APIError(
+                status: http.statusCode,
+                code: nil,
+                message: HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+            )
+        }
+
+        let safeName = suggestedFilename
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = safeName.isEmpty ? "resource.bin" : safeName
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("edgeever-share", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
     }
 
     /// Fetch an absolute public URL and return bytes + mime (for file:// WebView display).

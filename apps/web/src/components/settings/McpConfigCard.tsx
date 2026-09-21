@@ -5,6 +5,12 @@ import { Copy, KeyRound, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import type { ApiToken } from "@edgeever/shared";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  SETTINGS_CARD_DESCRIPTION_CLASSNAME,
+  SETTINGS_CARD_HEADER_CLASSNAME,
+  SETTINGS_CARD_ICON_CLASSNAME,
+  SETTINGS_CARD_TITLE_CLASSNAME,
+} from "./settings-ui";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -55,7 +61,7 @@ const McpExampleDialog = () => {
   return (
     <Dialog>
       <DialogTrigger asChild>
-        <Button size="sm" variant="outline" className="h-7 bg-white px-2.5 text-xs" type="button">
+        <Button size="sm" variant="outline" className="h-7 bg-card px-2.5 text-xs" type="button">
           {t("mcp.example")}
         </Button>
       </DialogTrigger>
@@ -70,7 +76,6 @@ const McpExampleDialog = () => {
           <Button
             size="md"
             variant="solid"
-            className="bg-emerald-600 text-white hover:bg-emerald-700"
             type="button"
             onClick={() => void handleCopy()}
           >
@@ -111,7 +116,7 @@ const AccessLevelPicker = ({ value, onChange }: AccessLevelPickerProps) => {
                   className={cn(
                     "flex h-8 cursor-pointer select-none items-center gap-1.5 rounded-[5px] px-2.5 text-xs font-medium transition-all focus-within:ring-2 focus-within:ring-emerald-500/40",
                     checked
-                      ? "bg-white font-semibold text-emerald-800 shadow-sm"
+                      ? "bg-card font-semibold text-emerald-800 shadow-sm"
                       : "text-slate-600 hover:text-slate-900"
                   )}
                 >
@@ -126,7 +131,7 @@ const AccessLevelPicker = ({ value, onChange }: AccessLevelPickerProps) => {
                   />
                   <span
                     aria-hidden="true"
-                    className={cn("h-1.5 w-1.5 rounded-full", checked ? "bg-emerald-600" : "bg-slate-400")}
+                    className={cn("h-1.5 w-1.5 rounded-full", checked ? "bg-emerald-500" : "bg-slate-400")}
                   />
                   {t(`mcp.accessLevels.${option}.label`)}
                 </label>
@@ -186,7 +191,7 @@ const TokenList = ({ tokens, availableScopes, newlyCreatedTokenId, isLoading, is
   }
 
   return (
-    <div className="overflow-hidden rounded-lg border border-slate-200 divide-y divide-slate-100 bg-white">
+    <div className="overflow-hidden rounded-lg border border-slate-200 divide-y divide-slate-100 bg-card">
       {tokens.map((token) => {
         const accessLevel = getStoredTokenAccessLevel(token.scopes, availableScopes);
         const accessLabel = accessLevel === "legacy-custom"
@@ -251,7 +256,7 @@ const TokenList = ({ tokens, availableScopes, newlyCreatedTokenId, isLoading, is
                     <Button
                       size="sm"
                       variant="outline"
-                      className="h-8 gap-1.5 border-slate-200 bg-white px-2.5 text-xs font-normal text-slate-700 hover:bg-slate-50 hover:text-slate-900"
+                      className="h-8 gap-1.5 border-slate-200 bg-card px-2.5 text-xs font-normal text-slate-700 hover:bg-slate-50 hover:text-slate-900"
                       aria-label={token.token ? t("mcp.copyToken") : t("mcp.legacyTokenCannotCopy")}
                       disabled={token.isRevoked || !token.token}
                       onClick={() => void handleCopy(token, "token")}
@@ -277,7 +282,7 @@ const TokenList = ({ tokens, availableScopes, newlyCreatedTokenId, isLoading, is
                     <Button
                       size="sm"
                       variant="outline"
-                      className="h-8 gap-1.5 border-slate-200 bg-white px-2.5 text-xs font-normal text-slate-700 hover:bg-slate-50 hover:text-slate-900"
+                      className="h-8 gap-1.5 border-slate-200 bg-card px-2.5 text-xs font-normal text-slate-700 hover:bg-slate-50 hover:text-slate-900"
                       aria-label={token.token ? t("mcp.copyConfig") : t("mcp.legacyConfigCannotCopy")}
                       disabled={token.isRevoked || !token.token}
                       onClick={() => void handleCopy(token, "config")}
@@ -369,14 +374,14 @@ export const McpConfigCard = () => {
   return (
     <>
       <Card className="w-full min-w-0 overflow-hidden shadow-none">
-        <CardHeader className="p-4 sm:p-5">
+        <CardHeader className={SETTINGS_CARD_HEADER_CLASSNAME}>
           <div className="flex items-start justify-between gap-3">
             <div>
-              <CardTitle className="flex items-center gap-2 text-sm">
-                <KeyRound className="h-4 w-4 text-emerald-700" />
+              <CardTitle className={SETTINGS_CARD_TITLE_CLASSNAME}>
+                <KeyRound className={SETTINGS_CARD_ICON_CLASSNAME} />
                 {t("mcp.title")}
               </CardTitle>
-              <CardDescription className="mt-1 text-xs text-slate-500">{t("mcp.description")}</CardDescription>
+              <CardDescription className={SETTINGS_CARD_DESCRIPTION_CLASSNAME}>{t("mcp.description")}</CardDescription>
             </div>
             <McpExampleDialog />
           </div>
@@ -385,7 +390,7 @@ export const McpConfigCard = () => {
           <div className="rounded-lg border border-slate-200/70 bg-slate-50/50 p-3 sm:p-3.5">
             <form className="flex flex-col gap-2.5 sm:flex-row sm:items-center" onSubmit={handleSubmit}>
               <Input
-                className="h-9 min-w-0 flex-1 bg-white text-xs"
+                className="h-9 min-w-0 flex-1 bg-card text-xs"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
                 placeholder={t("mcp.namePlaceholder")}
@@ -398,7 +403,7 @@ export const McpConfigCard = () => {
                 <Button
                   size="sm"
                   variant="solid"
-                  className="h-9 shrink-0 gap-1 bg-emerald-600 px-3.5 text-xs text-white hover:bg-emerald-700"
+                  className="h-9 shrink-0 gap-1 px-3.5 text-xs"
                   type="submit"
                   disabled={createMutation.isPending || !name.trim()}
                 >

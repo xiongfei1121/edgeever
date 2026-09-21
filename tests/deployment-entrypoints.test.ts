@@ -19,6 +19,11 @@ import {
   shouldRedeploy,
 } from "../scripts/upstream-sync-plan.mjs";
 import { repositoryWranglerConfigError } from "../scripts/wrangler-runner.mjs";
+import {
+  edgeEverDeploymentEnvironment,
+  hasPlaceholderD1Binding,
+  shouldRunEdgeEverDeployment,
+} from "../packages/wrangler/dispatch.mjs";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const normalizeLineEndings = (value: string) => value.replace(/\r\n/g, "\n");
@@ -110,6 +115,66 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(wranglerConfig).toContain("no_bundle = true");
     expect(wranglerConfig).toContain("find_additional_modules = true");
     expect(wranglerConfig).toContain('globs = ["modules/*.js"]');
+  });
+
+  test("Cloudflare's default Wrangler command cannot bypass the deployment pipeline", () => {
+    const packageJson = JSON.parse(readRepositoryFile("package.json"));
+    const shimPackage = JSON.parse(readRepositoryFile("packages/wrangler/package.json"));
+    const shim = readRepositoryFile("packages/wrangler/bin/wrangler.js");
+    const englishGuide = readRepositoryFile("docs/deploy-cloudflare-button.md");
+    const chineseGuide = readRepositoryFile("docs/deploy-cloudflare-button.zh-CN.md");
+
+    expect(packageJson.devDependencies.wrangler).toBe("workspace:*");
+    expect(shimPackage.name).toBe("wrangler");
+    expect(shimPackage.dependencies["edgeever-wrangler-cli"]).toMatch(/^npm:wrangler@/);
+    expect(shim).toContain('["run", "deploy"]');
+    const placeholderConfig = 'database_id = "00000000-0000-0000-0000-000000000000"';
+    const legacyConfig = 'database_id = "11111111-1111-1111-1111-111111111111"';
+    expect(hasPlaceholderD1Binding(placeholderConfig)).toBe(true);
+    expect(hasPlaceholderD1Binding(legacyConfig)).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(true);
+    expect(shouldRunEdgeEverDeployment(["deploy"], {}, placeholderConfig)).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1" },
+      legacyConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1", WRANGLER_CONFIG: "custom.toml" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--config", "custom.toml"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--env", "production"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--name", "custom-worker"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1", EDGE_EVER_WRANGLER_BYPASS_SHIM: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(edgeEverDeploymentEnvironment({ WORKERS_CI: "1" }))
+      .toMatchObject({
+        EDGE_EVER_DEPLOYMENT_TRIGGER: "main_push",
+        EDGE_EVER_DEPLOYMENT_METHOD: "cloudflare_workers_builds_default",
+      });
+    expect(englishGuide).toContain("Deploy command: npx wrangler deploy");
+    expect(chineseGuide).toContain("Deploy command: npx wrangler deploy");
   });
 
   test("deployment verification lets piped diagnostics flush before exiting", () => {
@@ -391,7 +456,13 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(workflow).not.toContain("force_redeploy:");
     expect(workflow).toContain("bun run db:migrate:local");
     expect(bunConfig).toContain('pathIgnorePatterns = ["tests/e2e/**"]');
-    expect(scripts.test).toBe("bun test --path-ignore-patterns='tests/e2e/**'");
+    expect(scripts.test).toBe("bun run test:bulk && bun run test:integration");
+    expect(scripts["test:bulk"]).toContain("--path-ignore-patterns='tests/e2e/**'");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/companion-learning.test.mjs");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/resource-upload-integration.test.mjs");
+    expect(scripts["test:integration"]).toBe(
+      "bun test apps/api/src/companion-learning.test.mjs apps/api/src/resource-upload-integration.test.mjs",
+    );
     expect(workflow).toContain("bun run test");
     expect(workflow.match(/if: steps\.upstream\.outputs\.align_mode == 'merge'/g)).toHaveLength(2);
     expect(workflow).toContain("git push origin HEAD:main");
@@ -770,6 +841,8 @@ describe("Cloudflare deployment entrypoints", () => {
   test("public deployment documentation exposes only Fork and Agent paths", () => {
     const englishReadme = readRepositoryFile("README.md");
     const chineseReadme = readRepositoryFile("README.zh-CN.md");
+    const traditionalChineseReadme = readRepositoryFile("README.zh-TW.md");
+    const japaneseReadme = readRepositoryFile("README.ja.md");
 
     expect(englishReadme).not.toContain("deploy.workers.cloudflare.com");
     expect(englishReadme).not.toContain("Option C: Manual Deployment");
@@ -777,6 +850,12 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(chineseReadme).not.toContain("deploy.workers.cloudflare.com");
     expect(chineseReadme).not.toContain("方案 C：手动部署");
     expect(chineseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
+    expect(traditionalChineseReadme).not.toContain("deploy.workers.cloudflare.com");
+    expect(traditionalChineseReadme).not.toContain("方案 C：手動部署");
+    expect(traditionalChineseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
+    expect(japaneseReadme).not.toContain("deploy.workers.cloudflare.com");
+    expect(japaneseReadme).not.toContain("方案 C：手動導入");
+    expect(japaneseReadme).toContain("Fork https://github.com/tianma-if/edgeever");
   });
 
   test("product site deployment prompts mirror the root READMEs", () => {

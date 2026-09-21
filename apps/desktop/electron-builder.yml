@@ -53,6 +53,9 @@ extraResources:
 mac:
   category: public.app-category.productivity
   icon: assets/icon.icns
+  minimumSystemVersion: "13.0"
+  extendInfo:
+    NSScreenCaptureUsageDescription: "EdgeEver captures a screenshot and saves it as a note."
   target:
     - target: dmg
     - target: zip
@@ -68,9 +71,12 @@ win:
   target:
     - nsis
   artifactName: EdgeEver-${version}-windows-${arch}.${ext}
+nsis:
+  oneClick: true
+  perMachine: false
 linux:
   category: Utility
   syncDesktopName: true
   target:
     - AppImage
-  artifactName: EdgeEver-${version}-linux-${arch}.${ext}
+  artifactName: EdgeEver-${version}-linux-x64.${ext}

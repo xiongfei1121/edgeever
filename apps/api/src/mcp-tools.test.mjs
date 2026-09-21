@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MCP_TOOLS } from "./mcp-tools";
+import { assertOpenAiCompatibleToolSchema, COMPANION_MCP_TOOLS } from "./companion-tool-catalog";
 
 describe("MCP tool catalog", () => {
   test("keeps tool names unique and schemas object-shaped", () => {
@@ -11,6 +12,19 @@ describe("MCP tool catalog", () => {
       expect(tool.inputSchema.type).toBe("object");
       expect(tool.outputSchema).toEqual({ type: "object" });
       expect(tool.annotations.openWorldHint).toBe(false);
+    }
+  });
+
+  test("keeps Agent tool JSON schemas compatible with OpenAI-style function calling", () => {
+    expect(COMPANION_MCP_TOOLS.length).toBeGreaterThan(20);
+    expect(() => assertOpenAiCompatibleToolSchema({ type: "object", oneOf: [] }, "bad_tool"))
+      .toThrow(/oneOf/);
+    expect(() => assertOpenAiCompatibleToolSchema({ type: "object", anyOf: [] }, "bad_tool"))
+      .toThrow(/anyOf/);
+    expect(() => assertOpenAiCompatibleToolSchema({ properties: { op: { const: "add_node" } } }, "bad_tool"))
+      .toThrow(/const/);
+    for (const tool of COMPANION_MCP_TOOLS) {
+      expect(() => assertOpenAiCompatibleToolSchema(tool.inputSchema, tool.name)).not.toThrow();
     }
   });
 
@@ -32,6 +46,58 @@ describe("MCP tool catalog", () => {
       destructiveHint: false,
       idempotentHint: true,
     });
+    expect(byName.get("create_diagram_memo")?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(byName.get("create_diagram_memo")?.inputSchema).toMatchObject({
+      required: ["notebookId", "kind", "nodes"],
+      properties: {
+        kind: { enum: ["mind-map", "flowchart", "architecture"] },
+        nodes: {
+          minItems: 1,
+          maxItems: 200,
+          items: { required: ["id", "label"] },
+        },
+        edges: { maxItems: 400 },
+        layout: { properties: { direction: { enum: ["left-to-right", "top-to-bottom"] } } },
+      },
+    });
+    expect(byName.get("create_diagram_memo")?.inputSchema.properties.nodes.items.properties.x).toBeUndefined();
+    expect(byName.get("create_diagram_memo")?.inputSchema.properties.nodes.items.properties.width).toBeUndefined();
+    expect(byName.get("get_diagram")?.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    });
+    expect(byName.get("get_diagram")?.inputSchema).toMatchObject({
+      required: ["memoId"],
+      properties: { includeLayout: { type: "boolean" } },
+    });
+    expect(byName.get("update_diagram")?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(byName.get("update_diagram")?.inputSchema).toMatchObject({
+      required: ["memoId", "expectedRevision", "operations"],
+      properties: {
+        operations: {
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: "object",
+            required: ["op"],
+            properties: {
+              op: { enum: ["add_node", "update_node", "remove_node", "add_edge", "update_edge", "remove_edge"] },
+            },
+          },
+        },
+      },
+    });
+    expect(byName.get("update_diagram")?.inputSchema.properties.operations.items.oneOf).toBeUndefined();
+    expect(byName.get("update_diagram")?.inputSchema.properties.operations.items.properties.op.const).toBeUndefined();
     expect(byName.get("rename_notebook")?.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
@@ -56,5 +122,7 @@ describe("MCP tool catalog", () => {
       destructiveHint: false,
       idempotentHint: true,
     });
+    expect(byName.get("search_memos")?.inputSchema.properties.createdAfter.format).toBeUndefined();
+    expect(byName.get("search_memos")?.description).toContain("createdAfter");
   });
 });

@@ -9,10 +9,12 @@ const executionContext = {
 
 const createDatabase = (options: { userId?: string; error?: Error } = {}) =>
   ({
-    prepare() {
+    prepare(sql: string) {
       return {
         async first() {
           if (options.error) throw options.error;
+          if (sql.includes("d1_migrations")) return { name: "0035_normalized_memo_tags.sql" };
+          if (sql.includes("object_storage_configs")) return { provider: "s3" };
           return options.userId ? { id: options.userId } : null;
         },
       };
@@ -74,7 +76,29 @@ describe("production authentication guard", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true });
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      build: expect.any(String),
+      deployment: { trigger: "unknown", method: "unknown" },
+      migration: "0035",
+      storage: { database: "d1", resources: "r2" },
+      objectStorageProvider: "s3",
+    });
+  });
+
+  test("reports deployment metadata supplied by the running instance", async () => {
+    const response = await fetchApi("/api/health", {
+      DB: createDatabase({ userId: "owner" }),
+      RESOURCES: {},
+      EDGE_EVER_AUTH_PASSWORD: "configured-secret",
+      EDGE_EVER_DEPLOYMENT_TRIGGER: "github_release",
+      EDGE_EVER_DEPLOYMENT_METHOD: "github_actions",
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      deployment: { trigger: "github_release", method: "github_actions" },
+    });
   });
 
   test("does not misreport transient D1 failures as unapplied migrations", async () => {

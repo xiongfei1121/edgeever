@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { resolveEditorDraftState } from "./editor-draft-state.ts";
+import { markdownToDoc } from "@edgeever/shared";
+import {
+  resolveEditorDraftState,
+  shouldReplaceEditorDocument,
+} from "./editor-draft-state.ts";
 
 const doc = (text) => ({ type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
 
@@ -48,6 +52,60 @@ describe("editor draft source resolution", () => {
     expect(state.title).toBe("Remote");
     expect(state.contentMarkdown).toBe("remote body");
     expect(state.hasUnsavedChanges).toBe(false);
+  });
+
+  test("preserves stored markdown that a JSON roundtrip would collapse", () => {
+    const stored = "时代公馆\n\n\n*提示：表格*";
+    const state = resolveEditorDraftState({
+      memo: {
+        ...memo,
+        contentJson: markdownToDoc(stored),
+        contentMarkdown: stored,
+      },
+    });
+
+    expect(state.contentMarkdown).toBe(stored);
+  });
+
+  test("falls back to serialized markdown when the stored source is empty", () => {
+    const state = resolveEditorDraftState({
+      memo: {
+        ...memo,
+        contentMarkdown: "",
+      },
+    });
+
+    expect(state.contentMarkdown).toBe("remote body");
+  });
+
+  test("repairs invalid saved gallery images and marks the memo for autosave", () => {
+    const state = resolveEditorDraftState({
+      memo: {
+        ...memo,
+        contentJson: {
+          type: "doc",
+          content: [
+            {
+              type: "edgeeverImageGallery",
+              attrs: { layout: "3" },
+              content: [{ type: "image", attrs: { src: null } }],
+            },
+            {
+              type: "edgeeverImageGallery",
+              attrs: { layout: "1" },
+              content: [
+                { type: "image", attrs: { src: "/one.png" } },
+                { type: "image", attrs: { src: "/two.png" } },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(state.contentJson.content).toHaveLength(1);
+    expect(state.contentJson.content[0].content).toHaveLength(2);
+    expect(state.hasUnsavedChanges).toBe(true);
   });
 
   test("uses a newer draft and marks it dirty without a queue entry", () => {
@@ -108,6 +166,24 @@ describe("editor draft source resolution", () => {
     expect(state.hasUnsavedChanges).toBe(false);
   });
 
+  test("preserves queued markdown that a JSON roundtrip would collapse", () => {
+    const stored = "时代公馆\n\n\n*提示：表格*";
+    const state = resolveEditorDraftState({
+      memo,
+      queuedUpdate: {
+        ...queue,
+        payload: {
+          ...queue.payload,
+          contentJson: markdownToDoc(stored),
+          contentMarkdown: stored,
+        },
+      },
+    });
+
+    expect(state.source).toBe("queue");
+    expect(state.contentMarkdown).toBe(stored);
+  });
+
   test("keeps the draft authoritative while its update remains queued", () => {
     const state = resolveEditorDraftState({
       memo,
@@ -123,5 +199,30 @@ describe("editor draft source resolution", () => {
 
     expect(state.source).toBe("draft");
     expect(state.hasUnsavedChanges).toBe(false);
+  });
+});
+
+describe("editor document hydration", () => {
+  test("does not replace a newly mounted empty note with the same empty document", () => {
+    const emptyDocument = { type: "doc", content: [{ type: "paragraph" }] };
+    expect(shouldReplaceEditorDocument(emptyDocument, emptyDocument)).toBe(false);
+  });
+
+  test("replaces the mounted memo when a recovered local draft has different content", () => {
+    expect(shouldReplaceEditorDocument(doc("remote body"), doc("recovered draft"))).toBe(true);
+  });
+
+  test("does not treat rich documents with the same markdown text as identical", () => {
+    const plainDocument = doc("same body");
+    const themedDocument = {
+      type: "doc",
+      content: [{ type: "edgeeverThemeBlock", attrs: { theme: "paper" }, content: plainDocument.content }],
+    };
+
+    expect(shouldReplaceEditorDocument(plainDocument, themedDocument)).toBe(true);
+  });
+
+  test("hydrates when the current editor document cannot be read", () => {
+    expect(shouldReplaceEditorDocument(null, doc("remote body"))).toBe(true);
   });
 });

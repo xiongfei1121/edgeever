@@ -1,26 +1,34 @@
 import "./styles.css";
 import "katex/dist/katex.min.css";
-import { Editor, mergeAttributes, Node } from "@tiptap/core";
-import StarterKit from "@tiptap/starter-kit";
+import { Graph } from "@antv/x6";
+import { Editor } from "@tiptap/core";
 import Image from "@tiptap/extension-image";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
 import Placeholder from "@tiptap/extension-placeholder";
 import CodeBlock from "@tiptap/extension-code-block";
-import { TableKit } from "@tiptap/extension-table";
-import { Markdown } from "@tiptap/markdown";
+import { EdgeEverLink } from "@edgeever/shared/editor-link";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { NodeSelection } from "@tiptap/pm/state";
 import mermaid from "mermaid";
 import { toCanvas } from "html-to-image";
 import {
+  createEdgeEverDocumentExtensions,
   createNativeUnsupportedContentExtensions,
+  DETAILS_EDITOR_CSS,
+  diagramDocumentToX6Cells,
+  attachDiagramReader,
+  MIND_MAP_CONNECTOR_NAME,
+  mindMapConnector,
   docToMarkdown,
   NativeAttachmentMetadata,
   prepareNativeEditorContent,
+  parseDiagramDocument,
+  stripDiagramDocumentMarker,
   resolveAttachmentKind,
   resolveNativeAttachmentContent,
   restoreNativeEditorContent,
+  wrapDetailsContentHtml,
   type TiptapDoc,
+  type DiagramDocument,
 } from "@edgeever/shared";
 import {
   type NoteImageTheme,
@@ -35,54 +43,19 @@ import {
   buildNoteImageCardMarkup,
   generateCardCss,
 } from "@edgeever/shared/note-image-card";
-import { createEdgeEverMathematics } from "./mathematics";
+import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
+import { createIosImageGallery } from "./document-nodes";
+import { createImageInsertTransaction, groupUploadedImages, NATIVE_IMAGE_GALLERY_CSS } from "@edgeever/shared/native-image-gallery";
 
-/** Keep in sync with packages/shared MergeDivider (iOS bundle cannot import monorepo shared). */
-const MERGE_DIVIDER_MARKDOWN_MARKER = "<!-- edgeever:merge-divider -->";
-const MERGE_DIVIDER_TOKENIZER =
-  /^<!--\s*edgeever:merge-divider\s*-->\s*(?:\n+---[ \t]*(?:\n+|$)|(?:\n+|$))/;
+const galleryStyle = document.createElement("style");
+galleryStyle.textContent = NATIVE_IMAGE_GALLERY_CSS;
+document.head.append(galleryStyle);
 
-const MergeDivider = Node.create({
-  name: "edgeeverMergeDivider",
-  group: "block",
-  atom: true,
-  selectable: true,
-  draggable: true,
-  parseHTML() {
-    return [{ tag: "hr[data-edgeever-merge-divider]" }];
-  },
-  renderHTML({ HTMLAttributes }) {
-    return [
-      "hr",
-      mergeAttributes(HTMLAttributes, {
-        "data-edgeever-merge-divider": "true",
-        class: "edgeever-merge-divider",
-      }),
-    ];
-  },
-  renderMarkdown() {
-    return `${MERGE_DIVIDER_MARKDOWN_MARKER}\n\n---`;
-  },
-  parseMarkdown(_token, helpers) {
-    return helpers.createNode("edgeeverMergeDivider");
-  },
-  markdownTokenizer: {
-    name: "edgeeverMergeDivider",
-    level: "block",
-    start(source: string) {
-      return source.indexOf(MERGE_DIVIDER_MARKDOWN_MARKER);
-    },
-    tokenize(source: string) {
-      const match = MERGE_DIVIDER_TOKENIZER.exec(source);
-      if (!match) return undefined;
-      return {
-        type: "edgeeverMergeDivider",
-        raw: match[0],
-        text: "",
-      };
-    },
-  },
-});
+const detailsStyle = document.createElement("style");
+detailsStyle.textContent = DETAILS_EDITOR_CSS;
+document.head.append(detailsStyle);
+
+Graph.registerConnector(MIND_MAP_CONNECTOR_NAME, mindMapConnector, true);
 
 type BridgeMessage =
   | { type: "ready"; startupMs: number }
@@ -90,6 +63,7 @@ type BridgeMessage =
   | { type: "loadResource"; requestId: string; source: string }
   | { type: "resourcePress"; targetJson: string }
   | { type: "imagePreview"; source: string; alt: string }
+  | { type: "doubleTap" }
   | { type: "pickImage" }
   | { type: "searchResult"; count: number; index: number }
   | { type: "imageExportChunk"; requestId: string; chunk: string }
@@ -318,6 +292,77 @@ async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
       // leave code block as-is
     }
   }
+}
+
+let viewerDiagramReader: ReturnType<typeof attachDiagramReader> | null = null;
+let viewerDiagramFrame: number | null = null;
+let viewerDiagram: DiagramDocument | null = null;
+let viewerDiagramGraph: Graph | null = null;
+let viewerDiagramObserver: ResizeObserver | null = null;
+let viewerDiagramContainer: HTMLElement | null = null;
+
+function clearViewerDiagramGraph() {
+  if (viewerDiagramFrame !== null) cancelAnimationFrame(viewerDiagramFrame);
+  viewerDiagramFrame = null;
+  viewerDiagramReader?.dispose();
+  viewerDiagramReader = null;
+  viewerDiagramObserver?.disconnect();
+  viewerDiagramObserver = null;
+  viewerDiagramGraph?.dispose();
+  viewerDiagramGraph = null;
+  viewerDiagramContainer?.remove();
+  viewerDiagramContainer = null;
+  editorEl.querySelector<HTMLElement>(".ProseMirror")?.removeAttribute("hidden");
+}
+
+function renderViewerDiagram(root: HTMLElement, diagram: DiagramDocument, theme: "light" | "dark") {
+  clearViewerDiagramGraph();
+  const proseMirror = root.querySelector<HTMLElement>(".ProseMirror");
+  if (!proseMirror) return false;
+  const cells = diagramDocumentToX6Cells(diagram, theme);
+  const container = document.createElement("div");
+  container.className = "edgeever-x6-diagram";
+  container.setAttribute("role", "img");
+  container.setAttribute("aria-label", diagram.kind === "mind-map" ? "思维导图" : diagram.kind === "architecture" ? "架构图" : "流程图");
+  // Keep TipTap's managed DOM intact. Replacing a node inside ProseMirror makes
+  // the next setContent call unreliable when SwiftUI reuses this WKWebView.
+  proseMirror.hidden = true;
+  root.append(container);
+  const parent = container.parentElement;
+  const measureWidth = () => {
+    if (!parent) return Math.max(1, container.clientWidth);
+    const style = getComputedStyle(parent);
+    const containerStyle = getComputedStyle(container);
+    const horizontalPadding = Number.parseFloat(style.paddingLeft || "0")
+      + Number.parseFloat(style.paddingRight || "0");
+    const horizontalMargin = Number.parseFloat(containerStyle.marginLeft || "0")
+      + Number.parseFloat(containerStyle.marginRight || "0");
+    return Math.max(1, parent.clientWidth - horizontalPadding - horizontalMargin);
+  };
+  const graph = new Graph({
+    container,
+    // The replacement node is empty at mount time and can briefly report 0.
+    // Anchor sizing to its stable parent so X6 cannot persist a 1px canvas.
+    width: measureWidth(),
+    height: Math.max(1, container.clientHeight),
+    background: { color: cells.canvas },
+    grid: false,
+    interacting: false,
+    panning: { enabled: true },
+    mousewheel: { enabled: true, minScale: 0.1, maxScale: 2.5 },
+  });
+  graph.addNodes(cells.nodes);
+  graph.addEdges(cells.edges);
+  const reader = attachDiagramReader(graph, container, { ...diagram, nodes: diagram.nodes.map((node, index) => ({ ...node, width: cells.nodes[index].width, height: cells.nodes[index].height })) }, locale, theme === "dark");
+  viewerDiagramReader = reader;
+  const fit = () => reader.resize(measureWidth(), Math.max(1, container.clientHeight));
+  viewerDiagramFrame = requestAnimationFrame(fit);
+  const observer = new ResizeObserver(fit);
+  observer.observe(parent ?? container);
+  viewerDiagramGraph = graph;
+  viewerDiagramObserver = observer;
+  viewerDiagramContainer = container;
+  return true;
 }
 
 const IMAGE_WIDTH_PRESETS = [
@@ -703,27 +748,25 @@ function createEdgeEverImageExtension() {
 
 function buildExtensions(placeholder: string) {
   return [
-    StarterKit.configure({
-      codeBlock: false,
+    ...createEdgeEverDocumentExtensions({
+      mathematics: createEdgeEverMathematics(),
+      starterKit: { codeBlock: false, link: false },
+      image: createEdgeEverImageExtension(),
+      gallery: createIosImageGallery(() => locale),
+      pdf: false,
+      file: false,
+      pluginEmbed: false,
+      table: { table: { resizable: false } },
+      markdown: true,
     }),
+    EdgeEverLink,
     NativeAttachmentMetadata,
-    TaskList,
-    TaskItem.configure({ nested: true }),
-    MergeDivider,
-    ...createEdgeEverMathematics(),
     CodeBlock.configure({
       languageClassPrefix: "language-",
-    }),
-    createEdgeEverImageExtension(),
-    TableKit.configure({
-      table: { resizable: false },
     }),
     ...createNativeUnsupportedContentExtensions(),
     Placeholder.configure({
       placeholder,
-    }),
-    Markdown.configure({
-      markedOptions: { gfm: true },
     }),
   ];
 }
@@ -748,6 +791,9 @@ const editor = new Editor({
       class: "edgeever-prose",
       spellcheck: "true",
     },
+    transformPastedHTML(html) {
+      return wrapDetailsContentHtml(html);
+    },
     handleClick(_view, _pos, event) {
       return handleResourcePointer(event as MouseEvent, "click");
     },
@@ -757,6 +803,17 @@ const editor = new Editor({
       },
     },
   },
+});
+
+// Evernote-style viewer shortcut: a deliberate double tap on ordinary note
+// content enters edit mode. Resource controls keep their existing gestures.
+editorEl.addEventListener("dblclick", (event) => {
+  if (mode !== "viewer") return;
+  const target = event.target as HTMLElement | null;
+  if (!target || target.closest("a, button, img, input, textarea, select, .edgeever-image-node")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  post({ type: "doubleTap" });
 });
 
 /**
@@ -1141,7 +1198,10 @@ async function afterContentSet(theme: "light" | "dark" = "light") {
   decorateAttachmentLinks(editorEl);
   await hydrateProtectedImages(editorEl);
   if (mode === "viewer") {
-    await renderMermaidBlocks(editorEl, theme);
+    if (!viewerDiagram || !renderViewerDiagram(editorEl, viewerDiagram, theme)) {
+      clearViewerDiagramGraph();
+      await renderMermaidBlocks(editorEl, theme);
+    }
   }
 }
 
@@ -1263,6 +1323,7 @@ export type EdgeEverEditorAPI = {
   exec: (actionId: string) => void;
   beginImageUpload: (uploadId: string, previewDataUrl: string) => void;
   completeImageUpload: (uploadId: string, imageUrl: string, alt: string) => void;
+  groupImages: (sources: string[]) => boolean;
   cancelImageUpload: (uploadId: string) => void;
   search: (query: string, requestedIndex: number) => void;
   exportImage: (request: ImageExportRequest) => void;
@@ -1304,21 +1365,28 @@ const api: EdgeEverEditorAPI = {
 
   setMarkdown(md) {
     suppressChange = true;
+    const diagram = mode === "viewer" ? parseDiagramDocument(md) : null;
+    viewerDiagram = diagram;
+    // Valid IR is drawn by read-only X6. Do not inject a hidden Mermaid
+    // document into TipTap; invalid envelopes keep the stripped fence.
+    const displayMarkdown = mode === "viewer"
+      ? (diagram ? "" : stripDiagramDocumentMarker(md))
+      : md;
     try {
-      editor.commands.setContent(md || "", { contentType: "markdown" } as never);
+      editor.commands.setContent(displayMarkdown || "", { contentType: "markdown" } as never);
     } catch {
       try {
         const manager = (editor.storage as { markdown?: { manager?: { parse: (s: string) => unknown } } }).markdown
           ?.manager;
         if (manager) {
-          editor.commands.setContent(manager.parse(md || "") as never);
+          editor.commands.setContent(manager.parse(displayMarkdown || "") as never);
         } else {
           throw new Error("no markdown manager");
         }
       } catch {
         editor.commands.setContent({
           type: "doc",
-          content: [{ type: "paragraph", content: md ? [{ type: "text", text: md }] : [] }],
+          content: [{ type: "paragraph", content: displayMarkdown ? [{ type: "text", text: displayMarkdown }] : [] }],
         });
       }
     }
@@ -1331,6 +1399,8 @@ const api: EdgeEverEditorAPI = {
 
   setDocumentFromJSON(json) {
     suppressChange = true;
+    viewerDiagram = null;
+    clearViewerDiagramGraph();
     try {
       const doc = JSON.parse(json) as TiptapDoc;
       editor.commands.setContent(prepareNativeEditorContent(
@@ -1465,20 +1535,17 @@ const api: EdgeEverEditorAPI = {
   },
 
   completeImageUpload(uploadId, imageUrl, alt) {
-    // Always mutate ProseMirror via setImage — DOM-only attr writes do not persist.
-    // Native hydrate rewrites display src under file:// after emitChange.
-    editor
-      .chain()
-      .focus()
-      .setImage({ src: imageUrl, alt: alt || uploadId || "" })
-      .run();
-    const imgs = editorEl.querySelectorAll("img");
-    const last = imgs[imgs.length - 1] as HTMLImageElement | undefined;
-    if (last) {
-      last.dataset.originalSrc = imageUrl;
-      delete last.dataset.uploadId;
-    }
+    if (!editor.isEditable) return;
+    editor.view.dispatch(createImageInsertTransaction(editor.state, {
+      src: imageUrl, alt: alt || uploadId || "",
+    }));
     emitChange(editor);
+  },
+
+  groupImages(sources) {
+    const grouped = groupUploadedImages(editor, sources);
+    if (grouped) emitChange(editor);
+    return grouped;
   },
 
   cancelImageUpload(uploadId) {

@@ -481,6 +481,23 @@ input {
   user-select: text;
   caret-color: auto;
   white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  font-feature-settings: "chws" 1;
+}
+
+/* Keep semantic emphasis visible even though the standalone shell disables
+ * synthetic font faces globally. Both values preserve nested bold-italic text. */
+.edgeever-mobile-tiptap-content strong,
+.edgeever-mobile-tiptap-content b {
+  font-synthesis: weight style;
+  font-weight: 800;
+}
+
+.edgeever-mobile-tiptap-content em,
+.edgeever-mobile-tiptap-content i {
+  font-synthesis: weight style;
+  font-style: italic;
 }
 
 /* External hyperlinks — match desktop default ProseMirror link styling. */
@@ -591,6 +608,26 @@ html.dark .edgeever-mobile-tiptap-content a:hover {
 .edgeever-mobile-tiptap-content ul[data-type="taskList"] ul[data-type="taskList"] {
   margin: 4px 0 0;
   padding-left: 24px;
+}
+
+.edgeever-mobile-tiptap-content .ee-inline-field-source {
+  font-size: 0;
+  color: transparent;
+}
+
+.edgeever-mobile-tiptap-content .ee-inline-field {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0.15rem;
+  padding: 0 0.45rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.55;
+  vertical-align: 0.12em;
 }
 
 .edgeever-mobile-tiptap-content blockquote {
@@ -876,6 +913,8 @@ html.dark .edgeever-mobile-tiptap-content a:hover {
 .edgeever-mobile-tiptap-content th p,
 .edgeever-mobile-tiptap-content td p {
   margin: 0;
+  letter-spacing: inherit;
+  line-height: inherit;
 }
 
 .edgeever-mobile-tiptap-content .selectedCell::after {

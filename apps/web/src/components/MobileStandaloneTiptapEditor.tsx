@@ -2,17 +2,16 @@ import "katex/dist/katex.min.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EditorContent, useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import { PdfAttachment } from "@/components/editor/PdfAttachment";
 import { FileAttachment } from "@/components/editor/FileAttachment";
 import Image from "@tiptap/extension-image";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { mergeAttributes } from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
-import { TableKit } from "@tiptap/extension-table";
-import { createExcerpt, docToMarkdown, docToText, emptyDoc, getImageReferrerPolicy, isPdfAttachment, MergeDivider, type MemoDetail, type MemoEditSession, type Notebook, type TagSummary, type TiptapDoc } from "@edgeever/shared";
+import { createExcerpt, createEdgeEverDocumentExtensions, docToMarkdown, docToText, emptyDoc, getImageReferrerPolicy, isPdfAttachment, wrapDetailsContentHtml, type MemoDetail, type MemoEditSession, type Notebook, type TagSummary, type TiptapDoc } from "@edgeever/shared";
 import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
 import { getMobileEditorInputAttributes, getMobileEditorPlaceholder } from "@edgeever/shared/mobile-editor";
+import { EdgeEverLink } from "@edgeever/shared/editor-link";
+import { createInlineFieldExtension } from "@/components/editor/InlineField";
 import {
   MobileEditorFallback,
   MobileEditorHeader,
@@ -194,23 +193,23 @@ export const MobileStandaloneTiptapEditor = ({
     };
   }, [memoId, readLocalDraft]);
 
+  const inlineFieldExtension = useMemo(() => createInlineFieldExtension(locale), [locale]);
   const editor = useEditor({
     extensions: [
-      StarterKit,
-      PdfAttachment,
-      FileAttachment,
-      TaskList,
-      TaskItem.configure({ nested: true }),
-      MergeDivider,
-      ...createEdgeEverMathematics(),
+      ...createEdgeEverDocumentExtensions({
+        mathematics: createEdgeEverMathematics(),
+        starterKit: { link: false },
+        image: ProtectedExternalImage.configure({
+          allowBase64: false,
+          inline: false,
+        }),
+        pdf: PdfAttachment,
+        file: FileAttachment,
+        table: { table: { renderWrapper: true } },
+      }),
+      EdgeEverLink,
+      inlineFieldExtension,
       ThemeBlock,
-      ProtectedExternalImage.configure({
-        allowBase64: false,
-        inline: false,
-      }),
-      TableKit.configure({
-        table: { renderWrapper: true },
-      }),
       Placeholder.configure({
         placeholder: getMobileEditorPlaceholder(locale),
       }),
@@ -218,6 +217,7 @@ export const MobileStandaloneTiptapEditor = ({
     content: emptyDoc(),
     editorProps: {
       attributes: getMobileEditorInputAttributes("edgeever-mobile-tiptap-content"),
+      transformPastedHTML: (html) => wrapDetailsContentHtml(html),
       handleKeyDown: (view, event) => {
         if (event.key !== "Backspace" || !preserveEmptyListIndentOnBackspace(view.state, view.dispatch)) {
           return false;

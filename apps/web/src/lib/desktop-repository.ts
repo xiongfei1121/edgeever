@@ -10,6 +10,11 @@ import { docToMarkdown, docToText, type MemoDetail } from "@edgeever/shared";
 import type { EdgeEverRepository } from "@/lib/repository";
 import { api, getConfiguredDesktopApiBaseUrl } from "@/lib/api";
 import { createStagedResourceListItem, mapMarkdownResourceUrls, mapTiptapResourceUrls, toApiResourceUrl, toDesktopResourceUrl } from "@/lib/desktop-resources";
+import {
+  contentReferencesStagedResourceUrl,
+  repairMemoStagedResourceUrls,
+  stagedResourceIdFromUrl,
+} from "@/lib/staged-resource-repair";
 import type { ResourceListItem, ResourceStorageSummary } from "@edgeever/shared";
 import { notifySyncQueueDeferred } from "@/lib/sync-events";
 
@@ -26,6 +31,35 @@ const toDisplayMemo = (memo: MemoDetail): MemoDetail => ({
   contentJson: mapTiptapResourceUrls(memo.contentJson, toDesktopResourceUrl),
   contentMarkdown: mapMarkdownResourceUrls(memo.contentMarkdown, toDesktopResourceUrl) ?? "",
 });
+
+const liveStagedIdsForMemo = async (memoId: string) => {
+  const staged = await listStagedResources();
+  return new Set(
+    staged
+      .filter((resource) => resource.memoId === memoId)
+      .map((resource) => stagedResourceIdFromUrl(resource.url))
+      .filter((id): id is string => Boolean(id)),
+  );
+};
+
+const resourcesForMemo = async (memoId: string) => {
+  const listed = await request("resource.list", { limit: 500 });
+  return listed.resources.filter((resource) => resource.memoId === memoId);
+};
+
+const repairDisplayedMemo = async (memo: MemoDetail): Promise<MemoDetail> => {
+  if (
+    !contentReferencesStagedResourceUrl(memo.contentJson)
+    && !contentReferencesStagedResourceUrl(memo.contentMarkdown)
+  ) {
+    return toDisplayMemo(memo);
+  }
+  const [resources, liveStagedIds] = await Promise.all([
+    resourcesForMemo(memo.id),
+    liveStagedIdsForMemo(memo.id),
+  ]);
+  return toDisplayMemo(repairMemoStagedResourceUrls(memo, resources, liveStagedIds));
+};
 
 const listStagedResources = async (): Promise<ResourceListItem[]> => {
   const bridge = window.edgeeverDesktop;
@@ -133,6 +167,17 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
     return { resource: { ...result.resource, url: toDesktopResourceUrl(result.resource.url) } };
   },
 
+  readResource: async (resourceId) => (
+    await api.getResourceResponse(`/api/v1/resources/${encodeURIComponent(resourceId)}/blob`, { cache: "no-store" })
+  ).blob(),
+
+  updateResource: async (resourceId, file, expectedContentHash) => {
+    const result = await api.updateResourceContent(resourceId, file, expectedContentHash);
+    await request("resource.delete", { resourceId });
+    await request("resource.cache", { resource: result.resource });
+    return { resource: { ...result.resource, url: toDesktopResourceUrl(result.resource.url) } };
+  },
+
   listResources: async () => {
     const local = await request("resource.list", { limit: 500 });
     const staged = await listStagedResources();
@@ -197,10 +242,11 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
     window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
     return result;
   }),
-  mergeMemos: (input) => request("memo.merge", input).then((result) => {
+  mergeMemos: async (input) => {
+    const result = await request("memo.merge", input);
     window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
-    return { memo: toDisplayMemo(result.memo) };
-  }),
+    return { memo: await repairDisplayedMemo(result.memo) };
+  },
 
   listMemos: (params) => {
     const rpcParams: DesktopMemoListParams = {
@@ -212,13 +258,14 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
 
   getMemo: async (memoId, includeDeleted = false) => {
     const result = await request("memo.get", { memoId, includeDeleted });
-    return { memo: toDisplayMemo(result.memo) };
+    return { memo: await repairDisplayedMemo(result.memo) };
   },
 
   createMemo: (input) => {
     const rpcParams: DesktopMemoCreateParams = {
       ...input,
       contentMarkdown: mapMarkdownResourceUrls(input.contentMarkdown, toApiResourceUrl),
+      contentText: input.contentJson ? docToText(input.contentJson) : undefined,
     };
     return request("memo.create", rpcParams).then((result) => {
       window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
@@ -227,10 +274,21 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
   },
 
   updateMemo: async (memo: MemoDetail, input) => {
-    const portableContentJson = mapTiptapResourceUrls(input.contentJson, toApiResourceUrl);
-    const contentMarkdown = input.contentMarkdown === undefined
+    const needsStagedRepair = contentReferencesStagedResourceUrl(input.contentJson)
+      || contentReferencesStagedResourceUrl(input.contentMarkdown);
+    const repairedInput = needsStagedRepair
+      ? repairMemoStagedResourceUrls(
+        { contentJson: input.contentJson, contentMarkdown: input.contentMarkdown },
+        ...(await Promise.all([resourcesForMemo(memo.id), liveStagedIdsForMemo(memo.id)])),
+      )
+      : input;
+    const portableContentJson = mapTiptapResourceUrls(repairedInput.contentJson ?? input.contentJson, toApiResourceUrl);
+    const contentMarkdown = repairedInput.contentMarkdown === undefined && input.contentMarkdown === undefined
       ? docToMarkdown(portableContentJson)
-      : mapMarkdownResourceUrls(input.contentMarkdown, toApiResourceUrl);
+      : mapMarkdownResourceUrls(
+        typeof repairedInput.contentMarkdown === "string" ? repairedInput.contentMarkdown : input.contentMarkdown,
+        toApiResourceUrl,
+      );
     const rpcParams: DesktopMemoUpdateParams & { contentText: string } = {
       memoId: memo.id,
       expectedRevision: memo.revision,
@@ -238,18 +296,18 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
       title: input.title,
       contentJson: portableContentJson,
       contentMarkdown,
-      contentText: docToText(input.contentJson),
+      contentText: docToText(portableContentJson),
       tags: input.tags,
     };
     const result = await request("memo.update", rpcParams);
     notifySyncQueueDeferred();
-    return { memo: toDisplayMemo(result.memo), queued: true as const };
+    return { memo: await repairDisplayedMemo(result.memo), queued: true as const };
   },
 
   adoptCloudMemo: async (memoId) => {
     const { discardDesktopMemoConflict } = await import("@/lib/desktop-sync");
     const memo = await discardDesktopMemoConflict(memoId);
-    return { memo: toDisplayMemo(memo) };
+    return { memo: await repairDisplayedMemo(memo) };
   },
 
   deleteMemo: (memoId, permanent = false) => request("memo.delete", { memoId, permanent }).then((result) => {

@@ -1,3 +1,4 @@
+import { DEFAULT_MEMO_TITLE } from "./content";
 import type { MemoDetail, Notebook } from "./types";
 
 export type SyncEntityType = "memo" | "notebook";
@@ -25,13 +26,19 @@ export type SyncChangesResponse = {
   changes: SyncChange[];
   cursor: number;
   hasMore: boolean;
-  serverCursor: number;
+  /** Absent on older servers; clients must keep the current mirror when omitted. */
+  serverCursor?: number;
   syncIdentity?: string;
 };
 
 export type SyncCursorState = {
   cursor: number;
   syncIdentity: string;
+};
+
+export type RemoteSyncCursorState = {
+  serverCursor?: number;
+  syncIdentity?: string;
 };
 
 export type SyncOutboxOperation =
@@ -95,6 +102,61 @@ export const getMemoSyncBaseConflictDetails = (
   source: "offline_sync" as const,
 });
 
+export type SameDeviceMemoSyncRecovery = "ack" | "rebase" | "conflict";
+
+const normalizeMemoSyncTitle = (value: unknown) => {
+  const title = typeof value === "string" ? value.trim() : "";
+  return title || DEFAULT_MEMO_TITLE;
+};
+
+const normalizeMemoSyncTags = (value: unknown) =>
+  Array.isArray(value) ? value.filter((tag): tag is string => typeof tag === "string") : [];
+
+export const memoUpdatePayloadMatchesRemote = (
+  payload: {
+    title?: unknown;
+    tags?: unknown;
+    contentMarkdown?: unknown;
+    contentJson?: unknown;
+  },
+  remote: {
+    title?: string | null;
+    tags?: readonly string[];
+    contentMarkdown?: string;
+    contentJson?: unknown;
+  },
+) => {
+  if (normalizeMemoSyncTitle(payload.title) !== normalizeMemoSyncTitle(remote.title)) {
+    return false;
+  }
+  const payloadTags = normalizeMemoSyncTags(payload.tags);
+  const remoteTags = normalizeMemoSyncTags(remote.tags);
+  if (payloadTags.length !== remoteTags.length || payloadTags.some((tag, index) => tag !== remoteTags[index])) {
+    return false;
+  }
+  const payloadMarkdown = typeof payload.contentMarkdown === "string" ? payload.contentMarkdown : "";
+  const remoteMarkdown = remote.contentMarkdown ?? "";
+  if (payloadMarkdown !== "" || remoteMarkdown !== "") {
+    return payloadMarkdown === remoteMarkdown;
+  }
+  return JSON.stringify(payload.contentJson ?? null) === JSON.stringify(remote.contentJson ?? null);
+};
+
+export const resolveSameDeviceMemoSyncRecovery = (input: {
+  current: MemoSyncBase;
+  expected: MemoSyncExpectedBase;
+  payloadMatchesRemote: boolean;
+  remoteProducedLocally: boolean;
+}): SameDeviceMemoSyncRecovery => {
+  if (input.payloadMatchesRemote) {
+    return "ack";
+  }
+  if (input.expected.expectedRevision < input.current.revision && input.remoteProducedLocally) {
+    return "rebase";
+  }
+  return "conflict";
+};
+
 export const createEmptySyncQueueSummary = (): SyncQueueSummary => ({
   total: 0,
   pending: 0,
@@ -139,4 +201,42 @@ export const getNextSyncQueueRetryDelay = (
   }
 
   return Math.max(minimumDelayMs, Math.min(...retryTimes) - now);
+};
+
+export const hasSyncCursorRewound = (localCursor: number, serverCursor?: number) =>
+  typeof serverCursor === "number"
+  && Number.isFinite(serverCursor)
+  && serverCursor < localCursor;
+
+export const hasSyncIdentityChanged = (localIdentity: string, serverIdentity?: string) =>
+  typeof serverIdentity === "string"
+  && serverIdentity.length > 0
+  && serverIdentity !== localIdentity;
+
+export const hasSyncStateReset = (
+  local: SyncCursorState,
+  remote: RemoteSyncCursorState,
+) => hasSyncCursorRewound(local.cursor, remote.serverCursor)
+  || hasSyncIdentityChanged(local.syncIdentity, remote.syncIdentity);
+
+export const isSyncMetadataInitialized = (
+  cursorValue: string | null | undefined,
+  identityValue: string | null | undefined,
+) => Boolean(identityValue?.trim())
+  && typeof cursorValue === "string"
+  && cursorValue.trim().length > 0
+  && Number.isFinite(Number(cursorValue));
+
+export const splitSyncBootstrapWriteBatches = <T>(
+  items: readonly T[],
+  batchSize: number,
+): T[][] => {
+  const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
+  if (items.length === 0) {
+    return [[]];
+  }
+  return Array.from(
+    { length: Math.ceil(items.length / normalizedBatchSize) },
+    (_, index) => items.slice(index * normalizedBatchSize, (index + 1) * normalizedBatchSize),
+  );
 };

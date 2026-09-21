@@ -7,8 +7,12 @@
 !.env.local-dev.example
 
 node_modules/
+__pycache__/
+*.py[cod]
 .idea/
 dist/
+!packages/plugin-api/dist/
+!packages/plugin-api/dist/**
 build/
 apps/extension/dist-firefox/
 apps/extension/web-ext-artifacts/
@@ -42,6 +46,9 @@ credentials.json
 
 # Local App Review crash dumps / image self-test screenshots.
 .tmp-app-review-crashes/
+
+# Generated Expo iOS tree; store iOS is apps/ios.
+apps/mobile/ios/
 
 # Local brand concept and research drafts.
 /assets/brand/edgeever-concept-13.png

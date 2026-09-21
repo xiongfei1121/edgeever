@@ -20,6 +20,10 @@ struct SettingsView: View {
     @State private var tab: RootTab?
     @State private var showLocalePicker = false
     @State private var copiedSystemInfo = false
+    @State private var instanceHealth: InstanceHealth?
+    @State private var instanceVersion: String?
+    @State private var instanceLatencyMilliseconds: Int?
+    @State private var instanceDiagnosticsFailed = false
 
     private var title: String {
         switch tab {
@@ -68,6 +72,10 @@ struct SettingsView: View {
         }
         .background(AppTheme.background.ignoresSafeArea())
         .preferredColorScheme(env.preferences.colorScheme)
+        .task(id: tab) {
+            guard tab == .system else { return }
+            await loadInstanceDiagnostics()
+        }
     }
 
     // MARK: - Header (Android settingsHeader)
@@ -293,9 +301,10 @@ struct SettingsView: View {
                     description: env.preferences.t("切换产品界面的显示语言。", en: "Switch the product UI language.")
                 ) {
                     Menu {
-                        Button(env.preferences.t("跟随系统", en: "System")) { env.preferences.localeCode = "system" }
+                        Button(env.preferences.t("跟随系统", en: "System", ja: "システムに合わせる")) { env.preferences.localeCode = "system" }
                         Button("简体中文") { env.preferences.localeCode = "zh-CN" }
                         Button("English") { env.preferences.localeCode = "en-US" }
+                        Button("日本語") { env.preferences.localeCode = "ja" }
                     } label: {
                         HStack {
                             Text(localeLabel)
@@ -448,14 +457,29 @@ struct SettingsView: View {
                     .frame(minHeight: 44)
                 }
                 .buttonStyle(.plain)
-
-                ForEach(Array(systemInfoItems.enumerated()), id: \.offset) { index, item in
-                    infoRow(item.label, item.value, showBorder: true)
-                }
-                infoRow(env.preferences.t("实例", en: "Instance"),
-                        env.session.session?.baseUrl ?? "—",
-                        showBorder: true)
             }
+
+            systemInfoGroup(
+                title: env.preferences.t("云端实例", en: "Cloud instance"),
+                description: env.preferences.t("当前连接实例的版本与部署环境。", en: "Version and deployment environment for the connected instance."),
+                icon: "cloud",
+                items: cloudSystemInfoItems,
+                notice: clientAheadOfInstanceNotice
+            )
+
+            systemInfoGroup(
+                title: env.preferences.t("当前客户端", en: "Current client"),
+                description: env.preferences.t("这台设备上的 EdgeEver 应用与运行环境。", en: "The EdgeEver app and runtime environment on this device."),
+                icon: "iphone",
+                items: clientSystemInfoItems
+            )
+
+            systemInfoGroup(
+                title: env.preferences.t("连接与同步", en: "Connection and sync"),
+                description: env.preferences.t("实例连接与本地同步队列状态。", en: "Connection and local sync queue status."),
+                icon: "arrow.triangle.2.circlepath",
+                items: connectionSystemInfoItems
+            )
 
             Button {
                 Task { await env.runSyncCycle() }
@@ -490,30 +514,261 @@ struct SettingsView: View {
         switch env.preferences.localeCode {
         case "zh-CN": return "简体中文"
         case "en-US": return "English"
-        default: return env.preferences.t("跟随系统", en: "System")
+        case "ja": return "日本語"
+        default: return env.preferences.t("跟随系统", en: "System", ja: "システムに合わせる")
         }
     }
 
-    private var systemInfoItems: [(label: String, value: String)] {
+    private var clientAheadOfInstanceNotice: String? {
+        let clientVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        guard let clientVersion, let instanceVersion, Self.isClient(clientVersion, aheadOfInstance: instanceVersion) else {
+            return nil
+        }
+        switch instanceHealth?.runtime {
+        case "cloudflare-workers":
+            return env.preferences.t(
+                "当前客户端版本高于云端实例。可等待每天自动更新，或手动运行 Update deployed EdgeEver 工作流。",
+                en: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or run the Update deployed EdgeEver workflow."
+            )
+        case "self-hosted-bun":
+            return env.preferences.t(
+                "当前客户端版本高于云端实例。可等待每天自动更新，或在安装目录执行 ./update.sh（默认 ~/edgeever）。",
+                en: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or run ./update.sh in the install directory (default ~/edgeever)."
+            )
+        default:
+            return env.preferences.t(
+                "当前客户端版本高于云端实例。可等待每天自动更新，也可手动更新实例。",
+                en: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or update the instance manually."
+            )
+        }
+    }
+
+    private static func isClient(_ clientVersion: String, aheadOfInstance instanceVersion: String) -> Bool {
+        func core(_ value: String) -> [Int]? {
+            let pattern = #"^v?(\d+)\.(\d+)\.(\d+)"#
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+            let range = NSRange(value.startIndex..., in: value)
+            guard let match = regex.firstMatch(in: value, range: range) else { return nil }
+            let numbers = (1...3).compactMap { index -> Int? in
+                guard let part = Range(match.range(at: index), in: value) else { return nil }
+                return Int(value[part])
+            }
+            return numbers.count == 3 ? numbers : nil
+        }
+        guard let client = core(clientVersion), let instance = core(instanceVersion) else { return false }
+        for index in 0..<3 where client[index] != instance[index] {
+            return client[index] > instance[index]
+        }
+        return false
+    }
+
+    private struct SystemInfoItem {
+        let label: String
+        let value: String
+        var localOnly = false
+    }
+
+    private var currentClientDisplaySize: String {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let screen = scene?.screen ?? UIScreen.main
+        let screenWidth = Int(screen.bounds.width.rounded())
+        let screenHeight = Int(screen.bounds.height.rounded())
+        guard screenWidth > 0, screenHeight > 0, screen.scale > 0 else {
+            return env.preferences.t("未知", en: "Unknown")
+        }
+        let screenText = "\(screenWidth)×\(screenHeight)"
+        let dpr = Self.formatDevicePixelRatio(screen.scale)
+        return env.preferences.t(
+            "\(screenText) @\(dpr)x",
+            en: "\(screenText) @\(dpr)x",
+            ja: "\(screenText) @\(dpr)x"
+        )
+    }
+
+    private static func formatDevicePixelRatio(_ value: CGFloat) -> String {
+        let rounded = (value * 100).rounded() / 100
+        if rounded == CGFloat(Int(rounded)) {
+            return String(Int(rounded))
+        }
+        return String(format: "%g", Double(rounded))
+    }
+
+    private var currentDeviceModel: String {
+        var info = utsname()
+        uname(&info)
+        let machine = withUnsafePointer(to: &info.machine) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: Int(_SYS_NAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        let trimmed = machine.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? env.preferences.t("未知", en: "Unknown") : trimmed
+    }
+
+    private var clientSystemInfoItems: [SystemInfoItem] {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
         let language = env.preferences.localeCode == "system"
             ? "\(env.preferences.resolvedLocale.identifier) (\(env.preferences.t("跟随系统", en: "Follow system")))"
             : env.preferences.resolvedLocale.identifier
         return [
-            (env.preferences.t("版本", en: "Version"), "v\(version)"),
-            (env.preferences.t("构建", en: "Build"), build),
-            (env.preferences.t("客户端", en: "Client"), env.preferences.t("移动应用", en: "Mobile app")),
-            (env.preferences.t("系统", en: "System"), "iOS"),
-            (env.preferences.t("系统版本", en: "System version"), UIDevice.current.systemVersion),
-            (env.preferences.t("语言", en: "Language"), language),
-            (env.preferences.t("时区", en: "Time zone"), TimeZone.current.identifier),
-            (env.preferences.t("安装形态", en: "Mode"), env.preferences.t("原生 SwiftUI 应用", en: "Native SwiftUI app")),
+            SystemInfoItem(label: env.preferences.t("版本", en: "Version"), value: "v\(version)"),
+            SystemInfoItem(label: env.preferences.t("构建", en: "Build"), value: build),
+            SystemInfoItem(label: env.preferences.t("客户端", en: "Client"), value: env.preferences.t("移动应用", en: "Mobile app")),
+            SystemInfoItem(label: env.preferences.t("系统", en: "System"), value: "iOS"),
+            SystemInfoItem(label: env.preferences.t("系统版本", en: "System version"), value: UIDevice.current.systemVersion),
+            SystemInfoItem(
+                label: env.preferences.t("设备型号", en: "Device model", ja: "機種"),
+                value: currentDeviceModel
+            ),
+            SystemInfoItem(
+                label: env.preferences.t("屏幕分辨率", en: "Screen resolution", ja: "画面解像度"),
+                value: currentClientDisplaySize
+            ),
+            SystemInfoItem(label: env.preferences.t("语言", en: "Language"), value: language),
+            SystemInfoItem(label: env.preferences.t("时区", en: "Time zone"), value: TimeZone.current.identifier),
+            SystemInfoItem(label: env.preferences.t("安装形态", en: "Mode"), value: env.preferences.t("原生 SwiftUI 应用", en: "Native SwiftUI app")),
         ]
     }
 
+    private var cloudSystemInfoItems: [SystemInfoItem] {
+        var items: [SystemInfoItem] = []
+        if let instanceURL = env.session.session?.baseUrl, !instanceURL.isEmpty {
+            items.append(SystemInfoItem(
+                label: env.preferences.t("实例地址", en: "Instance URL", ja: "インスタンス URL"),
+                value: instanceURL,
+                localOnly: true
+            ))
+        }
+        items.append(contentsOf: [
+            SystemInfoItem(
+                label: env.preferences.t("实例版本", en: "Instance version"),
+                value: instanceVersion.map { "v\($0.replacingOccurrences(of: "^v", with: "", options: .regularExpression))" } ?? unknownSystemInfoValue
+            ),
+            SystemInfoItem(label: env.preferences.t("实例构建", en: "Instance build"), value: instanceHealth?.build ?? unknownSystemInfoValue),
+            SystemInfoItem(label: env.preferences.t("数据库版本", en: "Database version"), value: instanceHealth?.migration ?? unknownSystemInfoValue),
+            SystemInfoItem(label: env.preferences.t("数据库后端", en: "Database backend"), value: databaseBackendLabel(instanceHealth?.storage?.database)),
+            SystemInfoItem(label: env.preferences.t("新上传对象存储", en: "New upload object storage"), value: objectStorageLabel(instanceHealth)),
+        ])
+        if instanceHealth?.objectStorageProvider == "s3" {
+            items.append(SystemInfoItem(
+                label: env.preferences.t("已有附件", en: "Existing attachments"),
+                value: env.preferences.t("继续从原存储读取", en: "Read from original storage")
+            ))
+        }
+        items.append(SystemInfoItem(
+            label: env.preferences.t("部署平台", en: "Deployment platform"),
+            value: deploymentPlatformLabel(instanceHealth?.runtime)
+        ))
+        if instanceHealth?.runtime == "self-hosted-bun" {
+            items.append(SystemInfoItem(
+                label: env.preferences.t("容器镜像来源", en: "Container image source"),
+                value: containerImageSourceLabel(instanceHealth?.containerImageSource)
+            ))
+        }
+        return items
+    }
+
+    private var connectionSystemInfoItems: [SystemInfoItem] {
+        let queueItems = env.session.dataScope.flatMap { try? env.outbox.listItems(scope: $0) } ?? []
+        let pending = queueItems.filter { $0.status == .pending || $0.status == .syncing }.count
+        let failed = queueItems.filter { $0.status == .error || $0.status == .conflict }.count
+        let connection = instanceHealth != nil
+            ? env.preferences.t("连接正常", en: "Connected")
+            : instanceDiagnosticsFailed
+                ? env.preferences.t("连接失败", en: "Connection failed")
+                : env.preferences.t("正在检查", en: "Checking")
+        return [
+            SystemInfoItem(label: env.preferences.t("实例连接", en: "Instance connection"), value: connection),
+            SystemInfoItem(
+                label: env.preferences.t("健康检查耗时", en: "Health check time", ja: "ヘルスチェック時間"),
+                value: instanceLatencyMilliseconds.map { "\($0) ms" } ?? unknownSystemInfoValue
+            ),
+            SystemInfoItem(label: env.preferences.t("待同步", en: "Pending sync"), value: String(pending)),
+            SystemInfoItem(label: env.preferences.t("失败或冲突", en: "Failed or conflicted"), value: String(failed)),
+        ]
+    }
+
+    private var unknownSystemInfoValue: String {
+        env.preferences.t("未知", en: "Unknown")
+    }
+
+    private func databaseBackendLabel(_ backend: String?) -> String {
+        switch backend {
+        case "d1": return "D1"
+        case "sqlite": return "SQLite"
+        case let value?: return value
+        case nil: return unknownSystemInfoValue
+        }
+    }
+
+    private func objectStorageLabel(_ health: InstanceHealth?) -> String {
+        if health?.objectStorageProvider == "s3" {
+            return env.preferences.t("第三方 S3 兼容 OSS", en: "Third-party S3-compatible OSS")
+        }
+        guard health?.objectStorageProvider == "builtin" else { return unknownSystemInfoValue }
+        switch health?.storage?.resources {
+        case "r2": return env.preferences.t("内置 R2", en: "Built-in R2")
+        case "filesystem": return env.preferences.t("本地文件系统", en: "Local filesystem")
+        case "s3": return env.preferences.t("实例内置 S3 兼容存储", en: "Instance-provided S3-compatible storage")
+        default: return unknownSystemInfoValue
+        }
+    }
+
+    private func deploymentPlatformLabel(_ runtime: String?) -> String {
+        switch runtime {
+        case "cloudflare-workers": return "Cloudflare"
+        case "self-hosted-bun": return "Docker"
+        default: return unknownSystemInfoValue
+        }
+    }
+
+    private func containerImageSourceLabel(_ source: String?) -> String {
+        switch source {
+        case "official-ghcr": return "GitHub Container Registry (GHCR)"
+        case "official-cn-mirror": return env.preferences.t("中国大陆官方镜像", en: "Official mainland China mirror")
+        case "custom": return env.preferences.t("自定义镜像", en: "Custom image")
+        default: return unknownSystemInfoValue
+        }
+    }
+
     private var systemInfoText: String {
-        systemInfoItems.map { "\($0.label): \($0.value)" }.joined(separator: "\n")
+        systemInfoText(includeLocalOnly: true)
+    }
+
+    private func systemInfoText(includeLocalOnly: Bool) -> String {
+        let keep: (SystemInfoItem) -> Bool = includeLocalOnly ? { _ in true } : { !$0.localOnly }
+        return [
+            systemInfoTextSection(env.preferences.t("云端实例", en: "Cloud instance"), items: cloudSystemInfoItems.filter(keep)),
+            systemInfoTextSection(env.preferences.t("当前客户端", en: "Current client"), items: clientSystemInfoItems.filter(keep)),
+            systemInfoTextSection(env.preferences.t("连接与同步", en: "Connection and sync"), items: connectionSystemInfoItems.filter(keep)),
+        ].joined(separator: "\n\n")
+    }
+
+    private func systemInfoTextSection(_ title: String, items: [SystemInfoItem]) -> String {
+        ([title] + items.map { "\($0.label): \($0.value)" }).joined(separator: "\n")
+    }
+
+    private func loadInstanceDiagnostics() async {
+        guard env.session.isSignedIn else {
+            instanceDiagnosticsFailed = true
+            return
+        }
+        instanceDiagnosticsFailed = false
+        let startedAt = Date()
+        do {
+            async let health = env.session.client.getInstanceHealth()
+            async let release = env.session.client.getInstanceRelease()
+            let (resolvedHealth, resolvedRelease) = try await (health, release)
+            instanceHealth = resolvedHealth
+            instanceVersion = resolvedRelease.version
+            instanceLatencyMilliseconds = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        } catch {
+            instanceHealth = nil
+            instanceVersion = nil
+            instanceLatencyMilliseconds = nil
+            instanceDiagnosticsFailed = true
+        }
     }
 
     private var feedbackURL: URL? {
@@ -541,7 +796,7 @@ struct SettingsView: View {
         \(notice)
 
         ```text
-        \(systemInfoText)
+        \(systemInfoText(includeLocalOnly: false))
         ```
         """
         var components = URLComponents(string: "https://github.com/tianma-if/edgeever/issues/new")
@@ -574,7 +829,43 @@ struct SettingsView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(AppTheme.border, lineWidth: 1)
-        )
+            )
+    }
+
+    private func systemInfoGroup(
+        title: String,
+        description: String,
+        icon: String,
+        items: [SystemInfoItem],
+        notice: String? = nil
+    ) -> some View {
+        settingsGroup(title: title, icon: icon) {
+            Text(description)
+                .font(.system(size: 12))
+                .foregroundStyle(AppTheme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+
+            if let notice {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(notice)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(AppTheme.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+            }
+
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                infoRow(item.label, item.value, showBorder: true)
+            }
+        }
     }
 
     private func preferenceBlock<Content: View>(
@@ -614,6 +905,7 @@ struct SettingsView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(AppTheme.title)
                 .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
         }
         .padding(16)
         .overlay(alignment: .top) {

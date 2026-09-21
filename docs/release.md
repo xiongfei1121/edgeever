@@ -4,6 +4,13 @@
 
 Run from a clean `main` branch on macOS that matches `origin/main`:
 
+For any Release that rebuilds desktop assets, first point the release shell at
+the repository-external Ed25519 key used for the Windows update manifest:
+
+```bash
+export EDGE_EVER_WINDOWS_UPDATE_SIGNING_KEY=/absolute/path/to/windows-update-ed25519-private.pem
+```
+
 ```bash
 bun run release -- \
   --bump patch \
@@ -11,10 +18,12 @@ bun run release -- \
   --label enhancement \
   --change-en "Run required release checks in parallel." \
   --change-zh "并行执行发布所需检查。" \
+  --change-locale "ja:必要なリリースチェックを並列実行します。" \
   --change-commit "abcdef1"
 ```
 
-Repeat `--change-en`, `--change-zh`, and `--change-commit` as matching groups.
+Repeat `--change-en`, `--change-zh`, `--change-locale ja:`, and `--change-commit` as matching groups.
+Japanese What's New is required because the App Store listing includes Japanese.
 One change may cover multiple comma-separated commits:
 
 ```bash
@@ -34,9 +43,11 @@ contain only user-visible changes, impact, and necessary migration guidance.
 
 Use `--dry-run` to inspect commit coverage, the native rebuild plan, and notes.
 After publication, the command does not download, install, or launch the macOS
-application. Existing desktop installations receive new versions through the
-in-app automatic updater. Pass `--install-desktop` explicitly only when the
-previous installation check is actually needed.
+application. Existing macOS, Windows, and Linux installations receive new
+versions through the in-app automatic updater. Linux Preview releases must pass
+a real AppImage-to-AppImage transition through the cross-version gate. Pass
+`--install-desktop` explicitly only when the previous installation check is
+actually needed.
 
 ## EdgeEver-Specific Behavior
 
@@ -47,8 +58,10 @@ previous installation check is actually needed.
   change only when that native runtime is rebuilt. Android `versionCode` and
   iOS build numbers remain independent, monotonically increasing identifiers.
 - A formal Release contains macOS arm64 and x64 DMGs, architecture-specific
-  updater ZIPs, and an Android arm64 APK. Unchanged native assets are reused
-  with their original filenames, versions, and checksums.
+  updater ZIPs, an unsigned Windows x64 Preview installer with an independently
+  signed update manifest, a Linux x64 AppImage Preview with updater metadata and a SHA-256 checksum
+  file, and an Android arm64 APK. Unchanged native assets are reused with their
+  original filenames, versions, and checksums.
 - Desktop and Android update checks use the version embedded in the applicable
   Release asset rather than the overall GitHub tag. This prevents a Web-only or
   API-only Release from prompting an unnecessary native update.
@@ -62,13 +75,21 @@ previous installation check is actually needed.
   audits the public Tencent TCR image inside Tencent Cloud after the formal
   Release is published. Its duration or failure does not block the GitHub
   Release or return a published version to Draft.
-- This command does not authorize or run mobile store delivery itself. After
-  Draft native assets are prepared, publication is blocked unless the Android
-  APK uses the Google Play app-signing certificate. If that gate fails, the
-  Release remains a Draft. Run
+- After Draft native assets are prepared, publication is blocked unless the
+  Android APK uses the Google Play app-signing certificate. If that gate fails,
+  the Release remains a Draft. Run
   `bun run publish:stores -- --release vX.Y.Z --platform android --android-track production`
-  for that Draft, then rerun the original release command to resume. See
+  for that Draft, then rerun the original release command to resume. When the
+  audited range includes iOS runtime changes, the same command starts Xcode
+  Cloud and submits App Review after GitHub publication. An iOS failure leaves
+  the GitHub Release published; retry with
+  `bun run publish:stores -- --release vX.Y.Z --platform ios`. See
   [Mobile Store Delivery](store-delivery.md).
+- After rebuilt desktop assets are uploaded to the Draft, the local release
+  command signs only `latest-windows.json`; the private key never enters GitHub
+  Actions. A second desktop workflow run downloads the Windows installer,
+  `latest.yml`, manifest, signature, and checksum file and independently audits
+  them before publication. See [Windows Preview security and updates](windows-preview.md).
 
 ## Registry Credentials
 
@@ -84,7 +105,8 @@ Independent builds are not required to have the same registry digest.
 
 ## Failure and Resume
 
-- Validation, Draft asset, or GHCR image failures leave the Release unpublished.
+- Validation, Windows signature/audit, Draft asset, or GHCR image failures leave
+  the Release unpublished.
 - An asynchronous CNB/TCR build failure leaves the formal Release intact and is
   repaired or rerun independently.
 - Rerunning the same command resumes a matching Draft created by an interrupted

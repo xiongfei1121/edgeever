@@ -9,7 +9,7 @@ struct MemoDetailView: View {
     @Environment(\.colorScheme) private var colorScheme
     let memoId: String
     /// Present editor from the parent `WorkspaceView` (more reliable than cover on a pushed page).
-    var onEdit: (String) -> Void = { _ in }
+    var onEdit: (String, MemoEditInitialFocus) -> Void = { _, _ in }
 
     @State private var memo: MemoDetail?
     @State private var showRevisions = false
@@ -45,6 +45,7 @@ struct MemoDetailView: View {
     @State private var showMoreMenu = false
     @State private var showNoteIdCopied = false
     @State private var showAiAssistant = false
+    @State private var showNotebookPicker = false
     @State private var resourceTarget: ResourceTarget?
     @State private var imagePreview: (source: String, alt: String)?
     /// TipTap EditorBundle is ~4MB; keep native text visible until first setContent finishes.
@@ -75,11 +76,11 @@ struct MemoDetailView: View {
         .background(AppTheme.card)
         // UIKit FAB in overlay — SwiftUI Button over WKWebView often receives zero taps.
         .overlay(alignment: .bottomTrailing) {
-            if let memo, !memo.isDeleted {
+            if let memo, !memo.isDeleted, !isVisualDiagram(memo) {
                 EditFabButton(
                     accessibilityLabel: env.preferences.t("编辑笔记", en: "Edit note")
                 ) {
-                    onEdit(memo.id)
+                    onEdit(memo.id, .body)
                 }
                 .frame(width: 56, height: 56)
                 .padding(.trailing, 12)
@@ -276,6 +277,17 @@ struct MemoDetailView: View {
                 }
             }
         }
+        .sheet(isPresented: $showNotebookPicker) {
+            EditNotebookPickerSheet(
+                notebooks: availableNotebooks,
+                selectedId: memo?.notebookId ?? ""
+            ) { notebookId in
+                showNotebookPicker = false
+                guard let memo else { return }
+                Task { await moveMemoToNotebook(memo, notebookId: notebookId) }
+            }
+            .presentationDetents([.medium, .large])
+        }
         .fullScreenCover(isPresented: Binding(
             get: { imagePreview != nil },
             set: { if !$0 { imagePreview = nil } }
@@ -304,8 +316,10 @@ struct MemoDetailView: View {
             titleVisibility: .visible
         ) {
             if let memo {
-                Button(env.preferences.t("编辑", en: "Edit")) { onEdit(memo.id) }
-                if !memo.isDeleted && !isTemporaryMemoId(memo.id) {
+                if !isVisualDiagram(memo) {
+                    Button(env.preferences.t("编辑", en: "Edit")) { onEdit(memo.id, .body) }
+                }
+                if !memo.isDeleted && !isTemporaryMemoId(memo.id) && !isVisualDiagram(memo) {
                     Button(env.preferences.t("AI 笔记助手", en: "AI note assistant")) {
                         showAiAssistant = true
                     }
@@ -393,6 +407,7 @@ struct MemoDetailView: View {
             searchQuery = ""
             searchMatchCount = 0
             searchMatchIndex = 0
+            showNotebookPicker = false
             load()
             refreshSyncStatus()
         }
@@ -634,35 +649,12 @@ struct MemoDetailView: View {
     private func detailBody(_ memo: MemoDetail) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
-                    if memo.isPinned {
-                        Text("★")
-                            .font(.system(size: 16))
-                            .foregroundStyle(AppTheme.secondary)
-                    }
-                    Text(localizedTitle(for: memo))
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundStyle(AppTheme.title)
-                        .lineLimit(4)
-                        .textSelection(.enabled)
-                        .accessibilityIdentifier(DetailMemoChrome.title)
-                }
+                detailTitleRow(memo)
                 .padding(.top, 16)
                 .edgeEverSuccessShine(trigger: pinPulse)
 
                 HStack(spacing: 8) {
-                    HStack(spacing: 4) {
-                        Text(notebookName(for: memo))
-                            .font(.system(size: 14))
-                            .foregroundStyle(AppTheme.secondary)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(AppTheme.muted)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .layoutPriority(0)
-                    .accessibilityIdentifier(DetailMemoChrome.notebook)
+                    notebookAffiliationControl(memo)
 
                     HStack(spacing: 8) {
                         Image(systemName: "tag")
@@ -684,6 +676,16 @@ struct MemoDetailView: View {
                 .frame(minHeight: 32)
                 .padding(.top, 12)
                 .accessibilityIdentifier(DetailMemoChrome.metaRow)
+
+                Text(
+                    "\(env.preferences.t("创建于", en: "Created")) \(MemoDetailDate.format(memo.createdAt, locale: env.preferences.resolvedLocale))"
+                    + " · "
+                    + "\(env.preferences.t("更新于", en: "Updated")) \(MemoDetailDate.format(memo.updatedAt, locale: env.preferences.resolvedLocale))"
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(AppTheme.muted)
+                .padding(.top, 4)
+                .textSelection(.enabled)
 
                 if searchOpen {
                     HStack(spacing: 8) {
@@ -766,7 +768,7 @@ struct MemoDetailView: View {
                     markdown: memo.contentMarkdown,
                     baseURL: env.session.session.flatMap { URL(string: $0.baseUrl) },
                     token: env.session.session?.token,
-                    locale: env.preferences.isEnglish ? "en-US" : "zh-CN",
+                    locale: env.preferences.apiLocale,
                     theme: colorScheme == .dark ? "dark" : "light",
                     placeholder: env.preferences.t("开始输入…", en: "Start writing…"),
                     onChange: nil,
@@ -775,6 +777,9 @@ struct MemoDetailView: View {
                     },
                     onImagePreview: { source, alt in
                         imagePreview = (source, alt)
+                    },
+                    onDoubleTap: isVisualDiagram(memo) ? nil : {
+                        onEdit(memo.id, .body)
                     },
                     onPickImage: nil,
                     onSearchResult: { count, index in
@@ -820,10 +825,45 @@ struct MemoDetailView: View {
         env.preferences.isEnglish ? syncStatus.labelEN : syncStatus.labelZH
     }
 
+    private var availableNotebooks: [Notebook] {
+        (try? env.mirror.listNotebooks(scope: env.session.dataScope ?? "")) ?? []
+    }
+
     private func notebookName(for memo: MemoDetail) -> String {
-        let notebooks = (try? env.mirror.listNotebooks(scope: env.session.dataScope ?? "")) ?? []
-        return notebooks.first(where: { $0.id == memo.notebookId })?.name
+        availableNotebooks.first(where: { $0.id == memo.notebookId })?.name
             ?? env.preferences.t("笔记本", en: "Notebook")
+    }
+
+    private func notebookAffiliationLabel(_ memo: MemoDetail) -> some View {
+        HStack(spacing: 4) {
+            Text(notebookName(for: memo))
+                .font(.system(size: 14))
+                .foregroundStyle(AppTheme.secondary)
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(AppTheme.muted)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .layoutPriority(0)
+    }
+
+    @ViewBuilder
+    private func notebookAffiliationControl(_ memo: MemoDetail) -> some View {
+        if memo.isDeleted {
+            notebookAffiliationLabel(memo)
+                .accessibilityIdentifier(DetailMemoChrome.notebook)
+        } else {
+            Button {
+                showNotebookPicker = true
+            } label: {
+                notebookAffiliationLabel(memo)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(env.preferences.t("所在笔记本", en: "Notebook"))
+            .accessibilityHint(env.preferences.t("更改笔记所属笔记本", en: "Change the notebook for this note"))
+            .accessibilityIdentifier(DetailMemoChrome.notebook)
+        }
     }
 
     private func handleSyncStatusPress() {
@@ -841,6 +881,34 @@ struct MemoDetailView: View {
         }
     }
 
+    private func detailTitleRow(_ memo: MemoDetail) -> some View {
+        HStack(spacing: 6) {
+            if memo.isPinned {
+                Text("★")
+                    .font(.system(size: 16))
+                    .foregroundStyle(AppTheme.secondary)
+            }
+            Button {
+                onEdit(memo.id, .title)
+            } label: {
+                Text(localizedTitle(for: memo))
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(AppTheme.title)
+                    .lineLimit(4)
+                    .multilineTextAlignment(.leading)
+            }
+            .buttonStyle(.plain)
+            .disabled(memo.isDeleted || isVisualDiagram(memo))
+            .accessibilityLabel(isVisualDiagram(memo)
+                ? env.preferences.t("图表标题", en: "Diagram title")
+                : env.preferences.t("编辑笔记标题", en: "Edit note title"))
+            .accessibilityHint(isVisualDiagram(memo)
+                ? env.preferences.t("可视化图表请在 Web 或桌面端编辑", en: "Edit visual diagrams on Web or desktop")
+                : env.preferences.t("进入编辑并聚焦标题", en: "Opens editing with the title focused"))
+            .accessibilityIdentifier(DetailMemoChrome.title)
+        }
+    }
+
     private func load() {
         guard let scope = env.session.dataScope else { return }
         do {
@@ -851,6 +919,10 @@ struct MemoDetailView: View {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private func isVisualDiagram(_ memo: MemoDetail) -> Bool {
+        memo.contentMarkdown.contains("<!-- edgeever-diagram-v1:")
     }
 
     private func refreshSyncStatus() {
@@ -900,6 +972,40 @@ struct MemoDetailView: View {
     private func localizedTitle(for memo: MemoDetail) -> String {
         let title = memo.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return title.isEmpty ? env.preferences.t("无标题笔记", en: "Untitled note") : title
+    }
+
+    private func moveMemoToNotebook(_ memo: MemoDetail, notebookId: String) async {
+        guard !memo.isDeleted else { return }
+        guard !notebookId.isEmpty, notebookId != memo.notebookId else { return }
+        guard let scope = env.session.dataScope else { return }
+        let revision = memo.revision
+        let contentHash = memo.contentHash
+        var updated = memo
+        updated.notebookId = notebookId
+        updated.updatedAt = EdgeEverDate.nowString()
+        do {
+            try env.mirror.upsertMemo(scope: scope, memo: updated)
+            self.memo = updated
+            try env.outbox.enqueueUpdate(
+                scope: scope,
+                payload: MemoUpdatePayload(
+                    memoId: updated.id,
+                    expectedRevision: revision,
+                    expectedContentHash: contentHash,
+                    title: updated.title ?? "",
+                    contentMarkdown: updated.contentMarkdown,
+                    contentJson: try? updated.contentJson.jsonString(),
+                    notebookId: notebookId,
+                    tags: updated.tags
+                )
+            )
+            await env.runSyncCycle()
+            load()
+            refreshSyncStatus()
+        } catch {
+            self.error = error.localizedDescription
+            load()
+        }
     }
 
     private func togglePin(_ memo: MemoDetail) async {

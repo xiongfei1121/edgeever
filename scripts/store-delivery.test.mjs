@@ -30,6 +30,19 @@ describe("store delivery command", () => {
     ).toBe(true);
   });
 
+  test("supports submitting an existing iOS build without rebuilding", () => {
+    expect(
+      parseStoreDeliveryArgs([
+        "--release",
+        "v1.7.0",
+        "--platform",
+        "ios",
+        "--ios-build-number",
+        "30",
+      ]).iosBuildNumber,
+    ).toBe("30");
+  });
+
   test("rejects malformed release tags", () => {
     expect(() => parseStoreDeliveryArgs(["--release", "latest"])).toThrow(
       "stable vX.Y.Z",
@@ -44,17 +57,62 @@ describe("store delivery command", () => {
 
     expect(workflow).not.toContain("bunx eas-cli");
     expect(workflow.match(/uses: expo\/expo-github-action@v8/g)).toHaveLength(
-      2,
+      1,
     );
-    expect(workflow.match(/eas-version: 21\.4\.0/g)).toHaveLength(2);
-    expect(workflow.match(/packager: npm/g)).toHaveLength(2);
+    expect(workflow.match(/eas-version: 21\.4\.0/g)).toHaveLength(1);
+    expect(workflow.match(/packager: npm/g)).toHaveLength(1);
     expect(workflow).toContain("for attempt in 1 2 3");
     expect(workflow).toContain("Dependency install failed on attempt ${attempt}/3");
     expect(
       workflow.match(
         /edgeever-bun-cache-\$\{GITHUB_RUN_ID\}-\$\{GITHUB_RUN_ATTEMPT\}/g,
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(2);
+    expect(workflow).not.toContain("eas build");
+    expect(workflow).not.toContain("--platform ios");
+    expect(workflow).toContain("working-directory: apps/ios");
+    expect(workflow).toContain(
+      "group: edgeever-store-delivery-${{ inputs.release_tag }}-${{ inputs.platform }}",
+    );
+    expect(workflow).toContain(".edgeever-ci/scripts/xcode-cloud-control.py");
+    expect(workflow).toContain("--wait-valid");
+    expect(workflow).not.toContain("--require-sha");
+    expect(workflow).not.toContain("--git-ref");
+    expect(workflow).toContain("git show \"$source_sha:apps/ios/Config/Version.xcconfig\"");
+    expect(workflow).toContain("cloud_version");
+    expect(workflow).toContain("grep -E '^(build_number|app_store_build_id|build_run_id|source_sha|processing_state)='");
+    expect(workflow).toContain('refs/tags/${RELEASE_TAG}');
+    expect(workflow).toContain(
+      "APP_STORE_BUILD_NUMBER: ${{ steps.ios_build.outputs.build_number }}",
+    );
+    expect(workflow).toContain("APP_STORE_RELEASE_NOTES_EN:");
+    expect(workflow).toContain("missing Japanese What's New");
+    expect(workflow).not.toContain(
+      "Pass ios_build_number; do not build from apps/mobile or EAS.",
+    );
+    expect(workflow).toContain(
+      "APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.EDGEEVER_APPLE_API_ISSUER }}",
+    );
+    expect(workflow).toContain(
+      "APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.EDGEEVER_APPLE_API_KEY_ID }}",
+    );
+    expect(workflow).toContain(
+      "APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.EDGEEVER_APPLE_API_KEY_BASE64 }}",
+    );
+    expect(workflow).toContain(
+      'PRECHECK_INCLUDE_IN_APP_PURCHASES: "false"',
+    );
+    expect(workflow).toContain("for attempt in {1..20}");
+    expect(workflow).toContain(
+      'Build number: ${APP_STORE_BUILD_NUMBER} does not exist',
+    );
+    expect(workflow).toContain("retrying in 60 seconds (${attempt}/20)");
+    const fastfile = readFileSync(
+      new URL("../apps/ios/fastlane/Fastfile", import.meta.url),
+      "utf8",
+    );
+    expect(fastfile).toContain("precheck_include_in_app_purchases: false");
+    expect(fastfile).toContain("APP_STORE_RELEASE_NOTES_JA is required");
   });
 
   test("replaces the GitHub APK with the Play-signed universal APK", () => {
@@ -155,15 +213,18 @@ describe("store delivery command", () => {
     expect(buildScript).not.toContain("armeabi-v7a,arm64-v8a,x86,x86_64");
   });
 
-  test("removes the sideload-only install permission from Play bundles", () => {
+  test("keeps the self-update install permission out of Android builds", () => {
     const buildScript = readFileSync(
       new URL("./build-android-local.sh", import.meta.url),
       "utf8",
     );
+    const appConfig = readFileSync(
+      new URL("../apps/mobile/app.json", import.meta.url),
+      "utf8",
+    );
 
-    expect(buildScript).toContain('if [[ "$MODE" == "play" ]]');
-    expect(buildScript).toContain('"$ANDROID_MANIFEST" play');
-    expect(buildScript).toContain('"$ANDROID_MANIFEST" sideload');
+    expect(appConfig).not.toContain("android.permission.REQUEST_INSTALL_PACKAGES");
+    expect(buildScript).not.toContain("configure-android-package-permissions");
     expect(buildScript).toContain(
       'grep -q "android.permission.REQUEST_INSTALL_PACKAGES" "$PACKAGED_MANIFEST"',
     );

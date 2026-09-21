@@ -6,9 +6,15 @@ import {
   actionNeedsTargetLanguage,
   actionNeedsTone,
   canReplaceAiSource,
+  getAiAssistantLastActionScope,
   getDefaultAiAction,
   getDefaultAiTargetLanguage,
   parseDefaultAiPromptKey,
+  buildAiAssistantLastActionPreference,
+  readStoredAiAssistantLastActionPreference,
+  resolveAiAssistantLastAction,
+  resolveAiAssistantOpenAction,
+  writeStoredAiAssistantLastActionPreference,
   promptAllowsAppend,
   promptAllowsReplace,
   promptNeedsTargetLanguage,
@@ -34,14 +40,71 @@ export const getDefaultTargetLanguage = getDefaultAiTargetLanguage;
 export {
   actionNeedsTargetLanguage,
   actionNeedsTone,
+  buildAiAssistantLastActionPreference,
   canReplaceAiSource,
+  getAiAssistantLastActionScope,
   getDefaultAiAction,
   parseDefaultAiPromptKey,
   promptAllowsAppend,
   promptAllowsReplace,
   promptNeedsTargetLanguage,
   promptNeedsTone,
+  readStoredAiAssistantLastActionPreference,
+  resolveAiAssistantLastAction,
+  resolveAiAssistantOpenAction,
+  writeStoredAiAssistantLastActionPreference,
 };
+
+export const resolveAiAssistantComposerInput = ({
+  composerText,
+  hasSelection,
+  isFreeformCustom,
+  noteContentMarkdown,
+  noteTitle,
+}: {
+  composerText: string;
+  hasSelection?: boolean;
+  isFreeformCustom: boolean;
+  noteContentMarkdown: string;
+  noteTitle: string;
+}) => {
+  const usesComposerAsSource = !isFreeformCustom
+    && !hasSelection
+    && !noteContentMarkdown.trim()
+    && Boolean(composerText.trim());
+  return {
+    contentMarkdown: usesComposerAsSource ? composerText : noteContentMarkdown,
+    customInstruction: isFreeformCustom ? composerText : "",
+    title: usesComposerAsSource ? "" : noteTitle,
+    usesComposerAsSource,
+  };
+};
+
+export const buildAiRefinementInstruction = ({
+  originalAction,
+  originalInstruction,
+  refinement,
+  targetLanguage,
+  tone,
+}: {
+  originalAction: AiAction;
+  originalInstruction?: string;
+  refinement: string;
+  targetLanguage?: AiTargetLanguage;
+  tone?: AiTone;
+}) => [
+  "Revise only the supplied current result according to the follow-up request.",
+  "Continue the original processing task instead of starting a different task. Preserve the result's language, purpose, factual meaning, and useful formatting unless the follow-up explicitly requests a change.",
+  `Original processing action:\n${originalAction}`,
+  originalInstruction?.trim()
+    ? `Original processing instruction:\n${originalInstruction.trim()}`
+    : undefined,
+  targetLanguage
+    ? `Keep the entire revised result in the target language: ${targetLanguage}. Do not translate it back to the language used by the follow-up request.`
+    : undefined,
+  tone ? `Keep the revised result in the requested tone: ${tone}.` : undefined,
+  `Follow-up request:\n${refinement}`,
+].filter(Boolean).join("\n\n");
 
 export const buildAiAssistantRequest = ({
   action,
@@ -96,3 +159,25 @@ export const buildAiAssistantRequest = ({
 };
 
 export type { AiPromptParameterKind, AiPromptResultMode };
+
+export type AiAssistantMode = "instruction" | "ask";
+const AI_ASSISTANT_MODE_KEY = "edgeever.aiAssistant.mode";
+
+export function readStoredAiAssistantMode(): AiAssistantMode {
+  try {
+    const value = localStorage.getItem(AI_ASSISTANT_MODE_KEY);
+    if (value === "ask" || value === "organize") return "ask";
+    if (value === "instruction") return "instruction";
+  } catch {
+    // Ignore unavailable storage.
+  }
+  return "instruction";
+}
+
+export function writeStoredAiAssistantMode(mode: AiAssistantMode) {
+  try {
+    localStorage.setItem(AI_ASSISTANT_MODE_KEY, mode);
+  } catch {
+    // Ignore unavailable storage.
+  }
+}

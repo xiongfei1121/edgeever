@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState, type ComponentRef, type ReactNode } from "react";
 import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
-import { buildGitHubFeedbackUrl, type AuthUser } from "@edgeever/shared";
-import { BackHandler, Linking, Modal, Platform, ScrollView, Switch, View } from "react-native";
-import { ActivityIndicator, Check, ChevronDown, ChevronLeft, ChevronRight, Copy, ExternalLink, Image as ImageIcon, Info, LogOut, MessageSquare, Moon, RefreshCw, ShieldCheck, SlidersHorizontal, Sun, UserRound } from "../components/icons";
+import type { InstanceHealth } from "@edgeever/client";
+import { buildGitHubFeedbackUrl, formatClientDisplaySize, isClientAheadOfInstance, type AuthUser } from "@edgeever/shared";
+import { useQuery } from "@tanstack/react-query";
+import { BackHandler, Dimensions, Linking, Modal, PixelRatio, Platform, ScrollView, Switch, View } from "react-native";
+import { Activity, ActivityIndicator, Check, ChevronDown, ChevronLeft, ChevronRight, Cloud, Copy, ExternalLink, Image as ImageIcon, Info, LogOut, MessageSquare, MonitorSmartphone, Moon, RefreshCw, ShieldCheck, SlidersHorizontal, Sun, UserRound } from "../components/icons";
 import { Pressable, Text } from "../components/LocalizedText";
 import { useMobileLocale } from "../lib/mobile-locale";
 import { useMobileTheme } from "../lib/mobile-theme";
 import { useMobileUpdate } from "../lib/mobile-update";
 import type { MobileLocalePreference } from "../lib/preferences";
+import { useSession } from "../lib/session";
+import { loadMobileSyncQueueSummary } from "../lib/sync-queue";
 import { AccountSecurityPanel } from "./AccountSecurityModal";
 import { getResolvedMobileLocale, isEnglishMobileLocale } from "./workspace-utils";
 import { styles } from "./workspace-styles";
@@ -16,6 +20,18 @@ import { styles } from "./workspace-styles";
 const useMobileLocalePreference = () => useMobileLocale().preference;
 
 const MOBILE_APP_VERSION = Constants.expoConfig?.version ?? "0.1.2";
+
+const readMobileDeviceModel = () => {
+  if (Platform.OS !== "android") return null;
+  const { Brand, Manufacturer, Model } = Platform.constants;
+  const model = typeof Model === "string" ? Model.trim() : "";
+  const manufacturer = typeof Manufacturer === "string" && Manufacturer.trim()
+    ? Manufacturer.trim()
+    : typeof Brand === "string" ? Brand.trim() : "";
+  if (!model) return manufacturer || null;
+  if (!manufacturer || model.toLowerCase().startsWith(manufacturer.toLowerCase())) return model;
+  return `${manufacturer} ${model}`;
+};
 
 const formatExecutionEnvironment = (environment: string | null | undefined, localePreference: MobileLocaleMode = "system") => {
   const english = isEnglishMobileLocale(localePreference);
@@ -35,9 +51,33 @@ const MOBILE_LOCALE_OPTIONS: Array<{ label: string; value: MobileLocalePreferenc
   { label: "跟随系统", value: "system" },
   { label: "简体中文", value: "zh-CN" },
   { label: "English", value: "en-US" },
+  { label: "日本語", value: "ja" },
 ];
 type SettingsTab = "general" | "account" | "system";
 export type MobileLocaleMode = MobileLocalePreference;
+
+type MobileInstanceDiagnostics = {
+  health: InstanceHealth;
+  latencyMs: number;
+  version: string;
+};
+
+type MobileSystemInfoItem = {
+  fullWidth?: boolean;
+  label: string;
+  localOnly?: boolean;
+  value: string;
+};
+
+type MobileSystemInfoGroup = {
+  description: string;
+  id: "cloud" | "client" | "connection";
+  items: MobileSystemInfoItem[];
+  notice?: string;
+  title: string;
+};
+
+type MobileSyncDiagnostics = Awaited<ReturnType<typeof loadMobileSyncQueueSummary>>;
 
 export const SettingsView = ({
   currentUser,
@@ -59,10 +99,36 @@ export const SettingsView = ({
   const { resolvedTheme, toggleTheme } = useMobileTheme();
   const { translate } = useMobileLocale();
   const { hasUpdate } = useMobileUpdate();
+  const { client, session } = useSession();
   const [activeTab, setActiveTab] = useState<SettingsTab | null>(null);
   const [localePickerOpen, setLocalePickerOpen] = useState(false);
   const [localePickerAnchor, setLocalePickerAnchor] = useState<{ left: number; top: number; width: number } | null>(null);
   const localeSelectRef = useRef<ComponentRef<typeof Pressable>>(null);
+  const syncQueueScope = session?.baseUrl ?? "";
+  const instanceDiagnosticsQuery = useQuery({
+    queryKey: ["mobile", "system-info", "instance", session?.baseUrl],
+    queryFn: async (): Promise<MobileInstanceDiagnostics> => {
+      const startedAt = Date.now();
+      const [health, release] = await Promise.all([
+        client!.getInstanceHealth(),
+        client!.getInstanceRelease(),
+      ]);
+      return {
+        health,
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        version: release.version,
+      };
+    },
+    enabled: activeTab === "system" && Boolean(client),
+    staleTime: 60 * 1000,
+    retry: 1,
+  });
+  const syncDiagnosticsQuery = useQuery({
+    queryKey: ["mobile", "system-info", "sync", syncQueueScope],
+    queryFn: () => loadMobileSyncQueueSummary(syncQueueScope),
+    enabled: activeTab === "system" && Boolean(session),
+    refetchInterval: activeTab === "system" ? 10_000 : false,
+  });
   const tabs: Array<{ key: SettingsTab; label: string; icon: ReactNode }> = [
     { key: "general", label: "常规设置", icon: <SlidersHorizontal color="#059669" size={17} /> },
     { key: "account", label: "登录设置", icon: <ShieldCheck color="#059669" size={17} /> },
@@ -80,8 +146,21 @@ export const SettingsView = ({
       setLocalePickerOpen(true);
     });
   };
-  const openFeedback = () => {
-    void Linking.openURL(buildMobileFeedbackUrl(localePreference));
+  const openFeedback = async () => {
+    const [instanceResult, syncResult] = await Promise.all([
+      instanceDiagnosticsQuery.data || !client
+        ? Promise.resolve(instanceDiagnosticsQuery.data)
+        : instanceDiagnosticsQuery.refetch().then((result) => result.data),
+      syncDiagnosticsQuery.data || !session
+        ? Promise.resolve(syncDiagnosticsQuery.data)
+        : syncDiagnosticsQuery.refetch().then((result) => result.data),
+    ]);
+    void Linking.openURL(buildMobileFeedbackUrl(localePreference, {
+      connectionState: instanceResult ? "connected" : instanceDiagnosticsQuery.isError ? "failed" : "checking",
+      instance: instanceResult,
+      instanceUrl: session?.baseUrl,
+      sync: syncResult,
+    }));
   };
 
   useEffect(() => {
@@ -101,7 +180,13 @@ export const SettingsView = ({
     if (activeTab === "system") {
       return (
         <View style={styles.settingsDetailList}>
-          <SystemInfoCard defaultExpanded />
+          <SystemInfoCard
+            connectionState={instanceDiagnosticsQuery.data ? "connected" : instanceDiagnosticsQuery.isError ? "failed" : "checking"}
+            defaultExpanded
+            instance={instanceDiagnosticsQuery.data}
+            instanceUrl={session?.baseUrl}
+            sync={syncDiagnosticsQuery.data}
+          />
         </View>
       );
     }
@@ -219,7 +304,7 @@ export const SettingsView = ({
                 </View>
                 <ChevronRight color="#94a3b8" size={17} />
               </Pressable>
-              <Pressable accessibilityRole="link" onPress={openFeedback} style={[styles.settingsMenuRow, styles.settingsMenuRowBorder]}>
+              <Pressable accessibilityRole="link" onPress={() => void openFeedback()} style={[styles.settingsMenuRow, styles.settingsMenuRowBorder]}>
                 <View style={styles.settingsMenuLabel}>
                   <View style={[styles.settingsMenuIcon, styles.settingsFeedbackIcon]}><MessageSquare color="#64748b" size={17} /></View>
                   <View style={styles.settingsFeedbackCopy}>
@@ -288,14 +373,26 @@ const SettingsActionButton = ({
   </Pressable>
 );
 
-const SystemInfoCard = ({ defaultExpanded = false }: { defaultExpanded?: boolean }) => {
+const SystemInfoCard = ({
+  connectionState,
+  defaultExpanded = false,
+  instance,
+  instanceUrl,
+  sync,
+}: {
+  connectionState: "checking" | "connected" | "failed";
+  defaultExpanded?: boolean;
+  instance?: MobileInstanceDiagnostics;
+  instanceUrl?: string;
+  sync?: MobileSyncDiagnostics;
+}) => {
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(defaultExpanded);
   const { checkForUpdate, hasUpdate, openUpdate, status, updateKind } = useMobileUpdate();
   const localePreference = useMobileLocalePreference();
   const english = isEnglishMobileLocale(localePreference);
   const copy = getMobileSystemInfoText(localePreference);
-  const infoItems = getMobileSystemInfoItems(localePreference);
+  const infoGroups = getMobileSystemInfoGroups(localePreference, { connectionState, instance, instanceUrl, sync });
   const description = hasUpdate ? copy.updateAvailableDescription : copy.description;
   const checking = status === "checking";
   const downloading = status === "downloading";
@@ -311,7 +408,9 @@ const SystemInfoCard = ({ defaultExpanded = false }: { defaultExpanded?: boolean
         : copy.openUpdate;
 
   const copySystemInfo = async () => {
-    await Clipboard.setStringAsync(infoItems.map((item) => `${item.label}: ${item.value}`).join("\n"));
+    await Clipboard.setStringAsync(infoGroups
+      .map((group) => [group.title, ...group.items.map((item) => `${item.label}: ${item.value}`)].join("\n"))
+      .join("\n\n"));
     setCopied(true);
     setTimeout(() => setCopied(false), 1600);
   };
@@ -354,55 +453,95 @@ const SystemInfoCard = ({ defaultExpanded = false }: { defaultExpanded?: boolean
           >
             {checking ? <ActivityIndicator color="#047857" size="small" /> : <RefreshCw color="#047857" size={16} />}
           </SettingsActionButton>
-          <View style={styles.systemInfoRows}>
-            {Array.from({ length: Math.ceil(infoItems.length / 3) }, (_, rowIndex) => {
-              const rowItems = infoItems.slice(rowIndex * 3, rowIndex * 3 + 3);
-
-              return (
-                <View
-                  key={`system-info-row-${rowIndex}`}
-                  style={[styles.systemInfoRow, rowIndex === Math.ceil(infoItems.length / 3) - 1 && styles.systemInfoRowLast]}
-                >
-                  {rowItems.map((item, itemIndex) => (
-                    <View
-                      key={item.label}
-                      style={[styles.systemInfoCell, itemIndex < rowItems.length - 1 && styles.systemInfoCellDivider]}
-                    >
-                      <Text numberOfLines={1} style={styles.panelLabel}>{item.label}</Text>
-                      <Text numberOfLines={1} selectable style={styles.systemInfoListValue}>
-                        {item.value}
-                      </Text>
-                    </View>
-                  ))}
-                </View>
-              );
-            })}
-          </View>
+          {infoGroups.map((group) => <MobileSystemInfoSection group={group} key={group.id} />)}
         </View>
       ) : null}
     </View>
   );
 };
 
+const MobileSystemInfoSection = ({ group }: { group: MobileSystemInfoGroup }) => (
+  <View style={styles.systemInfoSection}>
+    <View style={styles.systemInfoSectionHeader}>
+      {group.id === "cloud"
+        ? <Cloud color="#047857" size={16} />
+        : group.id === "client"
+          ? <MonitorSmartphone color="#047857" size={16} />
+          : <Activity color="#047857" size={16} />}
+      <View style={styles.systemInfoSectionCopy}>
+        <Text style={styles.systemInfoSectionTitle}>{group.title}</Text>
+        <Text style={styles.systemInfoSectionDescription}>{group.description}</Text>
+      </View>
+    </View>
+    {group.notice ? (
+      <View accessibilityLiveRegion="polite" style={styles.systemInfoNotice}>
+        <Info color="#94a3b8" size={14} />
+        <Text style={styles.systemInfoNoticeText}>{group.notice}</Text>
+      </View>
+    ) : null}
+    <View style={styles.systemInfoRows}>
+      {layoutMobileSystemInfoRows(group.items).map((rowItems, rowIndex, rows) => (
+        <View
+          key={`${group.id}-row-${rowIndex}`}
+          style={[styles.systemInfoRow, rowIndex === rows.length - 1 && styles.systemInfoRowLast]}
+        >
+          {rowItems.map((item, itemIndex) => (
+            <View
+              key={item.label}
+              style={[styles.systemInfoCell, itemIndex < rowItems.length - 1 && styles.systemInfoCellDivider]}
+            >
+              <Text numberOfLines={1} style={styles.panelLabel}>{item.label}</Text>
+              <Text numberOfLines={item.fullWidth ? 3 : 1} selectable style={styles.systemInfoListValue}>{item.value}</Text>
+            </View>
+          ))}
+        </View>
+      ))}
+    </View>
+  </View>
+);
+
 
 const getMobileSystemInfoText = (localePreference: MobileLocaleMode) =>
   isEnglishMobileLocale(localePreference)
     ? {
-        appIdentifier: "App identifier",
         build: "Build",
         client: "Client",
-        description: "View the current app version, build identifier, and runtime environment.",
-        disconnected: "Disconnected",
+        clientAheadOfInstanceCloudflare: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or run the Update deployed EdgeEver workflow.",
+        clientAheadOfInstanceDocker: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or run ./update.sh in the install directory (default ~/edgeever).",
+        clientAheadOfInstanceUnknown: "This client is newer than the connected cloud instance. You can wait for the daily automatic instance update, or update the instance manually.",
+        clientDescription: "The EdgeEver app and runtime environment on this device.",
+        clientSection: "Current client",
+        cloudDescription: "Version and deployment environment for the connected instance.",
+        cloudSection: "Cloud instance",
+        connected: "Connected",
+        connectionChecking: "Checking",
+        connectionDescription: "Connection and local sync queue status.",
+        connectionFailed: "Connection failed",
+        connectionSection: "Connection and sync",
+        containerImageSource: "Container image source",
+        databaseBackend: "Database backend",
+        databaseVersion: "Database version",
+        description: "View cloud instance and current client diagnostics.",
+        deploymentPlatform: "Deployment platform",
+        existingAttachments: "Existing attachments",
+        existingAttachmentsOriginalStorage: "Read from original storage",
+        failedSync: "Failed or conflicted",
         followSystem: "Follow system",
         installMode: "Mode",
+        instanceBuild: "Instance build",
+        instanceConnection: "Instance connection",
         instanceUrl: "Instance URL",
+        instanceVersion: "Instance version",
         language: "Language",
-        memoCount: "Notes",
-        notSet: "Not set",
-        notebookCount: "Notebooks",
+        newUploadObjectStorage: "New upload object storage",
+        pendingSync: "Pending sync",
         platform: "System",
         mobileApp: "Mobile app",
         platformVersion: "System version",
+        requestLatency: "Health check time",
+        deviceModel: "Device model",
+        screenResolution: "Screen resolution",
+        screenResolutionValue: "{{screen}} @{{dpr}}x",
         timeZone: "Time zone",
         openUpdate: "Get update",
         title: "System info",
@@ -412,21 +551,44 @@ const getMobileSystemInfoText = (localePreference: MobileLocaleMode) =>
         version: "Version",
       }
     : {
-        appIdentifier: "应用标识",
         build: "构建",
         client: "客户端",
-        description: "查看当前应用版本、构建标识和运行环境。",
-        disconnected: "未连接",
+        clientAheadOfInstanceCloudflare: "当前客户端版本高于云端实例。可等待每天自动更新，或手动运行 Update deployed EdgeEver 工作流。",
+        clientAheadOfInstanceDocker: "当前客户端版本高于云端实例。可等待每天自动更新，或在安装目录执行 ./update.sh（默认 ~/edgeever）。",
+        clientAheadOfInstanceUnknown: "当前客户端版本高于云端实例。可等待每天自动更新，也可手动更新实例。",
+        clientDescription: "这台设备上的 EdgeEver 应用与运行环境。",
+        clientSection: "当前客户端",
+        cloudDescription: "当前连接实例的版本与部署环境。",
+        cloudSection: "云端实例",
+        connected: "连接正常",
+        connectionChecking: "正在检查",
+        connectionDescription: "实例连接与本地同步队列状态。",
+        connectionFailed: "连接失败",
+        connectionSection: "连接与同步",
+        containerImageSource: "容器镜像来源",
+        databaseBackend: "数据库后端",
+        databaseVersion: "数据库版本",
+        description: "查看云端实例与当前客户端的诊断信息。",
+        deploymentPlatform: "部署平台",
+        existingAttachments: "已有附件",
+        existingAttachmentsOriginalStorage: "继续从原存储读取",
+        failedSync: "失败或冲突",
         followSystem: "跟随系统",
         installMode: "安装形态",
+        instanceBuild: "实例构建",
+        instanceConnection: "实例连接",
         instanceUrl: "实例地址",
+        instanceVersion: "实例版本",
         language: "语言",
-        memoCount: "笔记总数",
-        notSet: "未设置",
-        notebookCount: "笔记本数量",
+        newUploadObjectStorage: "新上传对象存储",
+        pendingSync: "待同步",
         platform: "系统",
         mobileApp: "移动应用",
         platformVersion: "系统版本",
+        requestLatency: "健康检查耗时",
+        deviceModel: "设备型号",
+        screenResolution: "屏幕分辨率",
+        screenResolutionValue: "{{screen}} @{{dpr}}x",
         timeZone: "时区",
         openUpdate: "前往更新",
         title: "系统信息",
@@ -436,8 +598,82 @@ const getMobileSystemInfoText = (localePreference: MobileLocaleMode) =>
         version: "版本",
       };
 
-const getMobileSystemInfoItems = (localePreference: MobileLocaleMode) => {
+const getMobileClientAheadNotice = (
+  copy: ReturnType<typeof getMobileSystemInfoText>,
+  instanceVersion: string | null | undefined,
+  runtime: string | null | undefined,
+) => {
+  if (!isClientAheadOfInstance(MOBILE_APP_VERSION, instanceVersion)) return undefined;
+  if (runtime === "cloudflare-workers") return copy.clientAheadOfInstanceCloudflare;
+  if (runtime === "self-hosted-bun") return copy.clientAheadOfInstanceDocker;
+  return copy.clientAheadOfInstanceUnknown;
+};
+
+const getMobileDeploymentPlatform = (runtime: string | null | undefined, english: boolean) => {
+  if (runtime === "cloudflare-workers") return "Cloudflare";
+  if (runtime === "self-hosted-bun") return "Docker";
+  return english ? "Unknown" : "未知";
+};
+
+const getMobileContainerImageSource = (source: string | null | undefined, english: boolean) => {
+  switch (source) {
+    case "official-ghcr": return "GitHub Container Registry (GHCR)";
+    case "official-cn-mirror": return english ? "Official mainland China mirror" : "中国大陆官方镜像";
+    case "custom": return english ? "Custom image" : "自定义镜像";
+    default: return english ? "Unknown" : "未知";
+  }
+};
+
+const getMobileDatabaseBackend = (backend: string | null | undefined, unknown: string) => {
+  if (backend === "d1") return "D1";
+  if (backend === "sqlite") return "SQLite";
+  return backend || unknown;
+};
+
+const getMobileObjectStorage = (health: InstanceHealth | undefined, english: boolean, unknown: string) => {
+  if (health?.objectStorageProvider === "s3") return english ? "Third-party S3-compatible OSS" : "第三方 S3 兼容 OSS";
+  if (health?.objectStorageProvider !== "builtin") return unknown;
+  switch (health.storage?.resources) {
+    case "r2": return english ? "Built-in R2" : "内置 R2";
+    case "filesystem": return english ? "Local filesystem" : "本地文件系统";
+    case "s3": return english ? "Instance-provided S3-compatible storage" : "实例内置 S3 兼容存储";
+    default: return unknown;
+  }
+};
+
+const layoutMobileSystemInfoRows = (items: MobileSystemInfoItem[]) => {
+  const rows: MobileSystemInfoItem[][] = [];
+  let buffer: MobileSystemInfoItem[] = [];
+  for (const item of items) {
+    if (item.fullWidth) {
+      if (buffer.length > 0) {
+        rows.push(buffer);
+        buffer = [];
+      }
+      rows.push([item]);
+      continue;
+    }
+    buffer.push(item);
+    if (buffer.length === 3) {
+      rows.push(buffer);
+      buffer = [];
+    }
+  }
+  if (buffer.length > 0) rows.push(buffer);
+  return rows;
+};
+
+const getMobileSystemInfoGroups = (
+  localePreference: MobileLocaleMode,
+  diagnostics: {
+    connectionState?: "checking" | "connected" | "failed";
+    instance?: MobileInstanceDiagnostics;
+    instanceUrl?: string;
+    sync?: MobileSyncDiagnostics;
+  } = {},
+): MobileSystemInfoGroup[] => {
   const copy = getMobileSystemInfoText(localePreference);
+  const english = isEnglishMobileLocale(localePreference);
   const resolvedLocale = getResolvedMobileLocale(localePreference);
   const platformName =
     Platform.OS === "android"
@@ -450,20 +686,88 @@ const getMobileSystemInfoItems = (localePreference: MobileLocaleMode) => {
             ? "Windows"
             : Platform.OS;
 
+  const instance = diagnostics.instance;
+  const connectionValue = diagnostics.connectionState === "connected"
+    ? copy.connected
+    : diagnostics.connectionState === "failed"
+      ? copy.connectionFailed
+      : copy.connectionChecking;
+  const pendingSync = diagnostics.sync
+    ? diagnostics.sync.pending + diagnostics.sync.syncing
+    : null;
+  const failedSync = diagnostics.sync
+    ? diagnostics.sync.error + diagnostics.sync.conflict
+    : null;
+
   return [
-    { label: copy.version, value: `v${MOBILE_APP_VERSION}` },
-    { label: copy.build, value: __DEV__ ? "development" : "production" },
-    { label: copy.client, value: copy.mobileApp },
-    { label: copy.platform, value: platformName },
-    { label: copy.platformVersion, value: String(Platform.Version) },
-    { label: copy.language, value: localePreference === "system" ? `${resolvedLocale} (${copy.followSystem})` : resolvedLocale },
-    { label: copy.timeZone, value: Intl.DateTimeFormat().resolvedOptions().timeZone || copy.unknown },
-    { label: copy.installMode, value: formatExecutionEnvironment(Constants.executionEnvironment, localePreference) },
+    {
+      description: copy.cloudDescription,
+      id: "cloud",
+      notice: getMobileClientAheadNotice(copy, instance?.version, instance?.health.runtime),
+      items: [
+        ...(diagnostics.instanceUrl
+          ? [{ fullWidth: true, label: copy.instanceUrl, localOnly: true, value: diagnostics.instanceUrl }]
+          : []),
+        { label: copy.instanceVersion, value: instance?.version ? `v${instance.version.replace(/^v/, "")}` : copy.unknown },
+        { label: copy.instanceBuild, value: instance?.health.build || copy.unknown },
+        { label: copy.databaseVersion, value: instance?.health.migration || copy.unknown },
+        { label: copy.databaseBackend, value: getMobileDatabaseBackend(instance?.health.storage?.database, copy.unknown) },
+        { label: copy.newUploadObjectStorage, value: getMobileObjectStorage(instance?.health, english, copy.unknown) },
+        ...(instance?.health.objectStorageProvider === "s3"
+          ? [{ label: copy.existingAttachments, value: copy.existingAttachmentsOriginalStorage }]
+          : []),
+        { label: copy.deploymentPlatform, value: getMobileDeploymentPlatform(instance?.health.runtime, english) },
+        ...(instance?.health.runtime === "self-hosted-bun"
+          ? [{ label: copy.containerImageSource, value: getMobileContainerImageSource(instance.health.containerImageSource, english) }]
+          : []),
+      ],
+      title: copy.cloudSection,
+    },
+    {
+      description: copy.clientDescription,
+      id: "client",
+      items: [
+        { label: copy.version, value: `v${MOBILE_APP_VERSION}` },
+        { label: copy.build, value: __DEV__ ? "development" : "production" },
+        { label: copy.client, value: copy.mobileApp },
+        { label: copy.platform, value: platformName },
+        { label: copy.platformVersion, value: String(Platform.Version) },
+        { label: copy.deviceModel, value: readMobileDeviceModel() || copy.unknown },
+        {
+          fullWidth: true,
+          label: copy.screenResolution,
+          value: formatClientDisplaySize({
+            devicePixelRatio: PixelRatio.get(),
+            screenHeight: Dimensions.get("screen").height,
+            screenWidth: Dimensions.get("screen").width,
+          }, copy.screenResolutionValue) || copy.unknown,
+        },
+        { label: copy.language, value: localePreference === "system" ? `${resolvedLocale} (${copy.followSystem})` : resolvedLocale },
+        { label: copy.timeZone, value: Intl.DateTimeFormat().resolvedOptions().timeZone || copy.unknown },
+        { label: copy.installMode, value: formatExecutionEnvironment(Constants.executionEnvironment, localePreference) },
+      ],
+      title: copy.clientSection,
+    },
+    {
+      description: copy.connectionDescription,
+      id: "connection",
+      items: [
+        { label: copy.instanceConnection, value: connectionValue },
+        { label: copy.requestLatency, value: instance ? `${instance.latencyMs} ms` : copy.unknown },
+        { label: copy.pendingSync, value: pendingSync === null ? copy.unknown : String(pendingSync) },
+        { label: copy.failedSync, value: failedSync === null ? copy.unknown : String(failedSync) },
+      ],
+      title: copy.connectionSection,
+    },
   ];
 };
 
-const buildMobileFeedbackUrl = (localePreference: MobileLocaleMode) => {
+const buildMobileFeedbackUrl = (
+  localePreference: MobileLocaleMode,
+  diagnostics: Parameters<typeof getMobileSystemInfoGroups>[1] = {},
+) => {
   const english = isEnglishMobileLocale(localePreference);
+  const infoGroups = getMobileSystemInfoGroups(localePreference, diagnostics);
 
   return buildGitHubFeedbackUrl({
     contentHeading: english ? "Feedback" : "反馈内容",
@@ -473,7 +777,12 @@ const buildMobileFeedbackUrl = (localePreference: MobileLocaleMode) => {
     privacyNotice: english
       ? "GitHub Issues are public. Do not include passwords, tokens, instance URLs, or private note content."
       : "GitHub Issue 公开可见，请勿提交密码、Token、实例地址或私人笔记内容。",
-    systemInfo: getMobileSystemInfoItems(localePreference),
+    systemInfo: infoGroups.flatMap((group) => group.items
+      .filter((item) => !item.localOnly)
+      .map((item) => ({
+        label: `${group.title} / ${item.label}`,
+        value: item.value,
+      }))),
     systemInfoHeading: english ? "System information" : "系统信息",
     systemInfoNotice: english
       ? "The following information was generated by EdgeEver to help diagnose the issue."

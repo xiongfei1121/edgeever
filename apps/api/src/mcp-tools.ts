@@ -1,3 +1,52 @@
+import { ARCHITECTURE_RESOURCE_ICONS } from "@edgeever/shared";
+
+const DIAGRAM_IR_NODE_TYPES = [
+  "topic",
+  "process",
+  "decision",
+  "start",
+  "end",
+  "terminator",
+  "client",
+  "frontend",
+  "service",
+  "database",
+  "storage",
+  "queue",
+  "security",
+  "external",
+  "boundary",
+] as const;
+
+const diagramNodeProperties = {
+  id: { type: "string", minLength: 1, maxLength: 100 },
+  label: { type: "string", maxLength: 500 },
+  type: { type: "string", enum: [...DIAGRAM_IR_NODE_TYPES] },
+  parentId: { type: "string", minLength: 1, maxLength: 100 },
+  resourceIcon: { type: "string", enum: [...ARCHITECTURE_RESOURCE_ICONS] },
+};
+
+const diagramNodeSchema = {
+  type: "object",
+  required: ["id", "label"],
+  additionalProperties: false,
+  properties: diagramNodeProperties,
+};
+
+const diagramEdgeSchema = {
+  type: "object",
+  required: ["source", "target"],
+  additionalProperties: false,
+  properties: {
+    id: { type: "string", minLength: 1, maxLength: 100 },
+    source: { type: "string", minLength: 1, maxLength: 100 },
+    target: { type: "string", minLength: 1, maxLength: 100 },
+    label: { type: "string", maxLength: 500 },
+    type: { type: "string", enum: ["dependency", "request", "async", "data"] },
+    bidirectional: { type: "boolean" },
+  },
+};
+
 const MCP_TOOL_DEFINITIONS = [
   {
     name: "get_current_user",
@@ -11,7 +60,7 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: "search_memos",
-    description: "Search active EdgeEver memos by text, tag, notebook, time range, pin state, or resource presence.",
+    description: "Search active EdgeEver memos by text, tag, notebook, time range, pin state, or resource presence. query is optional. For recently created or added notes, pass createdAfter and omit query; do not put this week/最近/新增 in query. Time bounds accept YYYY-MM-DD or ISO date-time.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -19,10 +68,10 @@ const MCP_TOOL_DEFINITIONS = [
         query: { type: "string" },
         notebookId: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
-        createdAfter: { type: "string", format: "date-time" },
-        createdBefore: { type: "string", format: "date-time" },
-        updatedAfter: { type: "string", format: "date-time" },
-        updatedBefore: { type: "string", format: "date-time" },
+        createdAfter: { type: "string", description: "ISO 8601 date (YYYY-MM-DD) or date-time. Date-only means 00:00:00.000Z." },
+        createdBefore: { type: "string", description: "ISO 8601 date (YYYY-MM-DD) or date-time. Date-only means 23:59:59.999Z." },
+        updatedAfter: { type: "string", description: "ISO 8601 date (YYYY-MM-DD) or date-time. Date-only means 00:00:00.000Z." },
+        updatedBefore: { type: "string", description: "ISO 8601 date (YYYY-MM-DD) or date-time. Date-only means 23:59:59.999Z." },
         isPinned: { type: "boolean" },
         hasResources: { type: "boolean" },
         limit: { type: "integer", minimum: 1, maximum: 50 },
@@ -71,6 +120,106 @@ const MCP_TOOL_DEFINITIONS = [
         tags: { type: "array", items: { type: "string" } },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
+      },
+    },
+  },
+  {
+    name: "create_diagram_memo",
+    description:
+      "Create an editable visual diagram memo from a semantic graph; EdgeEver generates node sizes, coordinates, edge IDs, and a deterministic layout. For mind maps, omit node type and use parentId for hierarchy. Flowchart node types are process, decision, start, or end. Architecture node types are client, frontend, service, database, storage, queue, security, external, or boundary; boundary nodes may contain nodes through parentId but cannot be edge endpoints.",
+    inputSchema: {
+      type: "object",
+      required: ["notebookId", "kind", "nodes"],
+      additionalProperties: false,
+      properties: {
+        notebookId: { type: "string", minLength: 1 },
+        title: { type: "string", maxLength: 160 },
+        kind: { type: "string", enum: ["mind-map", "flowchart", "architecture"] },
+        theme: { type: "string", enum: ["brand", "sun", "wa", "island", "rose", "mint", "cosmos", "tea", "naive", "macaron", "ocean", "ink", "classic", "paper"] },
+        structure: { type: "string", enum: ["map", "line", "capsule", "box", "circle", "ellipse", "hexagon", "logic", "tree", "brace", "org", "timeline", "fishbone"] },
+        layout: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            direction: { type: "string", enum: ["left-to-right", "top-to-bottom"] },
+          },
+        },
+        tags: { type: "array", maxItems: 100, items: { type: "string" } },
+        nodes: {
+          type: "array",
+          minItems: 1,
+          maxItems: 200,
+          items: diagramNodeSchema,
+        },
+        edges: {
+          type: "array",
+          maxItems: 400,
+          items: diagramEdgeSchema,
+        },
+      },
+    },
+  },
+  {
+    name: "get_diagram",
+    description:
+      "Read an editable diagram as a semantic graph. Coordinates and dimensions are omitted by default; set includeLayout only for an explicit visual-layout task.",
+    inputSchema: {
+      type: "object",
+      required: ["memoId"],
+      additionalProperties: false,
+      properties: {
+        memoId: { type: "string", minLength: 1 },
+        includeLayout: { type: "boolean", description: "Include node coordinates and dimensions. Defaults to false." },
+      },
+    },
+  },
+  {
+    name: "update_diagram",
+    description:
+      "Apply validated semantic operations to an existing diagram while preserving unaffected authored layout. Use expectedRevision to prevent concurrent overwrites. Set reflow to all only when the user explicitly wants a complete automatic layout.",
+    inputSchema: {
+      type: "object",
+      required: ["memoId", "expectedRevision", "operations"],
+      additionalProperties: false,
+      properties: {
+        memoId: { type: "string", minLength: 1 },
+        expectedRevision: { type: "integer", minimum: 0 },
+        dryRun: { type: "boolean" },
+        reflow: { type: "string", enum: ["preserve", "all"] },
+        operations: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: "object",
+            required: ["op"],
+            additionalProperties: false,
+            properties: {
+              op: {
+                type: "string",
+                enum: ["add_node", "update_node", "remove_node", "add_edge", "update_edge", "remove_edge"],
+              },
+              node: diagramNodeSchema,
+              nodeId: { type: "string", minLength: 1 },
+              edge: diagramEdgeSchema,
+              edgeId: { type: "string", minLength: 1 },
+              changes: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  label: { type: "string", maxLength: 500 },
+                  type: { type: "string", enum: [...DIAGRAM_IR_NODE_TYPES] },
+                  parentId: { type: "string", maxLength: 100 },
+                  resourceIcon: { type: "string", enum: [...ARCHITECTURE_RESOURCE_ICONS] },
+                  source: { type: "string", minLength: 1, maxLength: 100 },
+                  target: { type: "string", minLength: 1, maxLength: 100 },
+                  bidirectional: { type: "boolean" },
+                },
+              },
+              cascade: { type: "boolean" },
+            },
+          },
+        },
       },
     },
   },
@@ -470,7 +619,6 @@ const MCP_TOOL_DEFINITIONS = [
       type: "object",
       required: ["name"],
       additionalProperties: false,
-      anyOf: [{ required: ["memoId"] }, { required: ["contentMarkdown"] }],
       properties: {
         name: { type: "string", minLength: 1, maxLength: 160 },
         description: { type: "string", maxLength: 500 },
@@ -488,13 +636,6 @@ const MCP_TOOL_DEFINITIONS = [
       type: "object",
       required: ["templateId"],
       additionalProperties: false,
-      anyOf: [
-        { required: ["name"] },
-        { required: ["description"] },
-        { required: ["title"] },
-        { required: ["contentMarkdown"] },
-        { required: ["tags"] },
-      ],
       properties: {
         templateId: { type: "string", minLength: 1 },
         name: { type: "string", minLength: 1, maxLength: 160 },
@@ -578,13 +719,6 @@ const MCP_TOOL_DEFINITIONS = [
       type: "object",
       required: ["instructionId"],
       additionalProperties: false,
-      anyOf: [
-        { required: ["name"] },
-        { required: ["description"] },
-        { required: ["instruction"] },
-        { required: ["parameterKind"] },
-        { required: ["resultMode"] },
-      ],
       properties: {
         instructionId: { type: "string", minLength: 1 },
         name: { type: "string", minLength: 1, maxLength: 80 },
@@ -626,6 +760,7 @@ const READ_ONLY_MCP_TOOLS = new Set([
   "search_memos",
   "list_memos",
   "get_memo",
+  "get_diagram",
   "list_memo_resources",
   "list_resources",
   "list_memo_revisions",
@@ -642,6 +777,7 @@ const READ_ONLY_MCP_TOOLS = new Set([
 ]);
 const NON_DESTRUCTIVE_MCP_TOOLS = new Set([
   "create_memo",
+  "create_diagram_memo",
   "import_memos",
   "restore_memos",
   "move_memos",

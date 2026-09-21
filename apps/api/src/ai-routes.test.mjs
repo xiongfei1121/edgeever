@@ -30,7 +30,7 @@ const environment = {
     },
     resources: {},
   },
-  EDGE_EVER_STORAGE_ENCRYPTION_KEY: "x".repeat(32),
+  EDGE_EVER_AUTH_PASSWORD: "x".repeat(32),
 };
 
 class SqliteD1PreparedStatement {
@@ -84,7 +84,7 @@ const createDatabaseEnvironment = () => {
     sqlite,
     environment: {
       storage: { db: new SqliteD1Database(sqlite), resources: {} },
-      EDGE_EVER_STORAGE_ENCRYPTION_KEY: "x".repeat(32),
+      EDGE_EVER_AUTH_PASSWORD: "x".repeat(32),
     },
   };
 };
@@ -127,6 +127,44 @@ describe("AI route contracts", () => {
     const input = { action: "summarize", title: "Note", contentMarkdown: "Body" };
     expect(AiGenerateSchema.parse(input).stream).toBe(false);
     expect(AiGenerateSchema.parse({ ...input, stream: true }).stream).toBe(true);
+  });
+
+  test("allows custom generation from an empty note while source-based actions still require content", async () => {
+    expect(AiGenerateSchema.safeParse({
+      action: "custom",
+      title: "",
+      contentMarkdown: "",
+      instruction: "Write a friendly greeting email.",
+    }).success).toBe(true);
+    expect(AiGenerateSchema.safeParse({
+      action: "custom",
+      promptId: "aiprompt_blank_note_generator",
+      title: "",
+      contentMarkdown: "",
+    }).success).toBe(true);
+    expect(AiGenerateSchema.safeParse({
+      action: "summarize",
+      title: "",
+      contentMarkdown: "",
+    }).success).toBe(false);
+
+    const app = createApp();
+    const response = await app.request(
+      "/api/v1/ai/generate",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "summarize", title: "", contentMarkdown: "" }),
+      },
+      environment,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "ai_source_required",
+        message: "Note content is required for this AI action.",
+      },
+    });
   });
 
   test("validates AI tag suggestion inputs without requiring saved note content", () => {
@@ -266,6 +304,36 @@ describe("AI route contracts", () => {
     sqlite.close();
   });
 
+  test("prepares tag suggestions with model credentials and no provider call", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+    const response = await app.request(
+      "/api/v1/ai/tag-suggestions/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Note", contentMarkdown: "Body about React", currentTags: ["Current"] }),
+      },
+      databaseEnvironment,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.apiKey).toBe("secret");
+    expect(body.prompt).toContain("Body about React");
+    expect(body.currentTags).toEqual(["Current"]);
+    expect(body.maxOutputTokens).toBe(300);
+  });
+
   test("defers prompt-specific action and parameter validation to the saved prompt", () => {
     expect(AiGenerateSchema.safeParse({
       action: "custom",
@@ -315,6 +383,65 @@ describe("AI route contracts", () => {
       environment,
     );
     expect(response.status).toBe(400);
+  });
+
+  test("prepares a direct generation payload without calling the model provider", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+
+    const response = await app.request(
+      "/api/v1/ai/generate/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "summarize", title: "Note", contentMarkdown: "Body" }),
+      },
+      databaseEnvironment,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.apiKey).toBe("secret");
+    expect(body.provider).toBe("openai-compatible");
+    expect(body.baseUrl).toBe("https://models.example.com/v1");
+    expect(body.modelId).toBe("model-a");
+    expect(body.prompt).toContain("Body");
+    expect(body.system).toContain(body.resultBoundary.start);
+    expect(body.system).toContain(body.resultBoundary.end);
+  });
+
+  test("returns the default model endpoint without the API key", async () => {
+    const app = createApp();
+    const { environment: databaseEnvironment } = createDatabaseEnvironment();
+    const created = await app.request(
+      "/api/v1/ai/providers",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(validSettings),
+      },
+      databaseEnvironment,
+    );
+    expect(created.status).toBe(201);
+
+    const response = await app.request("/api/v1/ai/direct-target", {}, databaseEnvironment);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      provider: "openai-compatible",
+      baseUrl: "https://models.example.com/v1",
+      modelId: "model-a",
+    });
+    expect(body.apiKey).toBeUndefined();
   });
 
   test("rejects actions outside the shared note-processing catalog", async () => {

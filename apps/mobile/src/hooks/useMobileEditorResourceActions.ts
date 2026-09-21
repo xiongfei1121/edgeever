@@ -39,7 +39,7 @@ export const useMobileEditorResourceActions = ({
   token,
 }: Options) => {
   const unavailable = useCallback((english: string, chinese: string) =>
-    new Error(resolvedLocale === "en-US" ? english : chinese), [resolvedLocale]);
+    new Error(resolvedLocale !== "zh-CN" ? english : chinese), [resolvedLocale]);
 
   const loadEditorResource = useCallback((source: string) => {
     if (!client) return Promise.resolve(null);
@@ -54,19 +54,19 @@ export const useMobileEditorResourceActions = ({
 
   const downloadResource = useCallback(async (target: MobileResourceTarget) => {
     if (!client) throw unavailable("The attachment client is unavailable.", "当前无法读取附件。");
-    await openMobileResource(client, target);
-  }, [client, unavailable]);
+    await openMobileResource(client, target, { baseUrl: sessionBaseUrl ?? baseUrl, token });
+  }, [baseUrl, client, sessionBaseUrl, token, unavailable]);
 
   const saveResourceAs = useCallback(async (target: MobileResourceTarget) => {
     if (!client) throw unavailable("The resource client is unavailable.", "当前无法读取资源。");
-    const result = await saveMobileResourceAs(client, target);
+    const result = await saveMobileResourceAs(client, target, { baseUrl: sessionBaseUrl ?? baseUrl, token });
     if (result.kind === "saf") {
       Alert.alert(
-        resolvedLocale === "en-US" ? "Downloaded" : "下载成功",
-        resolvedLocale === "en-US" ? `Saved ${result.filename}` : `已保存：${result.filename}`,
+        resolvedLocale !== "zh-CN" ? "Downloaded" : "下载成功",
+        resolvedLocale !== "zh-CN" ? `Saved ${result.filename}` : `已保存：${result.filename}`,
       );
     }
-  }, [client, resolvedLocale, unavailable]);
+  }, [baseUrl, client, resolvedLocale, sessionBaseUrl, token, unavailable]);
 
   const requireMutableClient = useCallback(() => {
     if (!client || !canMutate()) {

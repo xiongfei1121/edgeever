@@ -1,4 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  DEFAULT_CUSTOM_DARK_COLORS,
+  DEFAULT_CUSTOM_EDITOR_THEME,
+  DEFAULT_CUSTOM_LIGHT_COLORS,
+  normalizeThemeColors,
+  type CustomEditorTheme,
+  type ThemeColors,
+} from "@/lib/custom-editor-theme";
+
+export {
+  DEFAULT_CUSTOM_DARK_COLORS,
+  DEFAULT_CUSTOM_EDITOR_THEME,
+  DEFAULT_CUSTOM_LIGHT_COLORS,
+  localizeStoredCustomThemeName,
+} from "@/lib/custom-editor-theme";
+export type { CustomEditorTheme, ThemeColors } from "@/lib/custom-editor-theme";
 
 export type ThemePreference = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
@@ -72,63 +88,37 @@ export const MARKDOWN_THEME_NAMES = [
 export type MarkdownThemeName = (typeof MARKDOWN_THEME_NAMES)[number];
 export const MARKDOWN_THEME_PREFERENCES = ["auto", ...MARKDOWN_THEME_NAMES] as const;
 export type MarkdownThemePreference = (typeof MARKDOWN_THEME_PREFERENCES)[number];
+export const MARKDOWN_LIGHT_THEME_NAMES = [
+  "github-light",
+  "solarized-light",
+  "xcode-light",
+  "duotone-light",
+] as const satisfies readonly MarkdownThemeName[];
+export const isMarkdownLightTheme = (theme: MarkdownThemeName): boolean =>
+  (MARKDOWN_LIGHT_THEME_NAMES as readonly MarkdownThemeName[]).includes(theme);
 
 export const EDITOR_THEME_NAMES = [
   "default",
   "minimal-emerald",
   "outline-emerald",
+  "letter",
+  "guide",
+  "blueprint",
+  "journal",
+  "stance",
+  "stub",
+  "brief",
+  "outline",
+  "zen",
+  "grove",
   "wechat-green",
   "modern-mint",
-  "marxico",
   "custom",
 ] as const;
 export type EditorThemeName = string;
 
-export interface ThemeColors {
-  background: string;
-  text: string;
-  muted: string;
-  heading: string;
-  accent: string;
-  soft: string;
-  border: string;
-}
-
-export interface CustomEditorTheme {
-  id: string;
-  name: string;
-  light: ThemeColors;
-  dark: ThemeColors;
-  customCss?: string;
-}
-
-export const DEFAULT_CUSTOM_LIGHT_COLORS: ThemeColors = {
-  background: "#fffdf7",
-  text: "#292524",
-  muted: "#57534e",
-  heading: "#1c1917",
-  accent: "#0f766e",
-  soft: "#f0fdfa",
-  border: "#99f6e4",
-};
-
-export const DEFAULT_CUSTOM_DARK_COLORS: ThemeColors = {
-  background: "#1c1917",
-  text: "#fafaf9",
-  muted: "#d6d3d1",
-  heading: "#fafaf9",
-  accent: "#2dd4bf",
-  soft: "#292524",
-  border: "#44403c",
-};
-
-export const DEFAULT_CUSTOM_EDITOR_THEME: CustomEditorTheme = {
-  id: "custom-default",
-  name: "My custom theme",
-  light: DEFAULT_CUSTOM_LIGHT_COLORS,
-  dark: DEFAULT_CUSTOM_DARK_COLORS,
-  customCss: "",
-};
+export const isNamedEditorTheme = (theme: string) =>
+  (EDITOR_THEME_NAMES as readonly string[]).includes(theme) && theme !== "custom";
 
 interface AppearanceThemeContextValue {
   preference: ThemePreference;
@@ -214,7 +204,7 @@ export const getStoredMarkdownTheme = (): MarkdownThemePreference => {
   const stored = readLocalStorageItem(MARKDOWN_THEME_STORAGE_KEY);
   return MARKDOWN_THEME_PREFERENCES.includes(stored as MarkdownThemePreference)
     ? (stored as MarkdownThemePreference)
-    : "tokyo-night";
+    : "auto";
 };
 
 export const resolveMarkdownTheme = (
@@ -226,20 +216,17 @@ export const resolveMarkdownTheme = (
     : preference;
 
 export const getStoredEditorTheme = (): string => {
-  return readLocalStorageItem(EDITOR_THEME_STORAGE_KEY) || "default";
+  const stored = readLocalStorageItem(EDITOR_THEME_STORAGE_KEY) || "default";
+  if (stored !== "marxico") return stored;
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(EDITOR_THEME_STORAGE_KEY, "default");
+    } catch {
+      // Private mode / blocked storage — preference stays session-only.
+    }
+  }
+  return "default";
 };
-
-const isHexColor = (value: unknown): value is string => typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
-
-const normalizeThemeColors = (value: Partial<ThemeColors> | undefined, fallback: ThemeColors): ThemeColors => ({
-  background: isHexColor(value?.background) ? value.background : fallback.background,
-  text: isHexColor(value?.text) ? value.text : fallback.text,
-  muted: isHexColor(value?.muted) ? value.muted : fallback.muted,
-  heading: isHexColor(value?.heading) ? value.heading : fallback.heading,
-  accent: isHexColor(value?.accent) ? value.accent : fallback.accent,
-  soft: isHexColor(value?.soft) ? value.soft : fallback.soft,
-  border: isHexColor(value?.border) ? value.border : fallback.border,
-});
 
 const normalizeCustomEditorTheme = (theme: CustomEditorTheme): CustomEditorTheme => ({
   ...theme,
@@ -270,8 +257,8 @@ export const getStoredCustomEditorThemes = (): CustomEditorTheme[] => {
       if (oldTheme && typeof oldTheme.name === "string") {
         const migratedTheme: CustomEditorTheme = {
           id: "custom-migrated",
-          name: oldTheme.name || "My custom theme",
-          light: {
+          name: oldTheme.name || DEFAULT_CUSTOM_EDITOR_THEME.name,
+          light: normalizeThemeColors({
             background: oldTheme.background || DEFAULT_CUSTOM_LIGHT_COLORS.background,
             text: oldTheme.text || DEFAULT_CUSTOM_LIGHT_COLORS.text,
             muted: oldTheme.muted || DEFAULT_CUSTOM_LIGHT_COLORS.muted,
@@ -279,7 +266,7 @@ export const getStoredCustomEditorThemes = (): CustomEditorTheme[] => {
             accent: oldTheme.accent || DEFAULT_CUSTOM_LIGHT_COLORS.accent,
             soft: oldTheme.soft || DEFAULT_CUSTOM_LIGHT_COLORS.soft,
             border: oldTheme.border || DEFAULT_CUSTOM_LIGHT_COLORS.border,
-          },
+          }, DEFAULT_CUSTOM_LIGHT_COLORS),
           dark: DEFAULT_CUSTOM_DARK_COLORS,
           customCss: "",
         };

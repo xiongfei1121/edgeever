@@ -70,6 +70,7 @@ export const SessionProvider = ({ children }: { children: ReactNode }) => {
       baseUrl: session.baseUrl,
       token: session.token,
       fetch: expoFetch as typeof fetch,
+      directAiGeneration: true,
       onUnauthorized: () => {
         queryClient.clear();
         setSession(null);
@@ -81,7 +82,7 @@ export const SessionProvider = ({ children }: { children: ReactNode }) => {
   const signIn = useCallback(async (input: { baseUrl: string; username: string; password: string }) => {
     const baseUrl = normalizeInstanceUrl(resolveInstanceUrlInput(input.baseUrl));
     const deviceId = await getOrCreateDeviceId();
-    const loginClient = createEdgeEverClient({ baseUrl });
+    const loginClient = createEdgeEverClient({ baseUrl, fetch: expoFetch as typeof fetch });
     const authSession = await loginClient.login({
       username: input.username,
       password: input.password,

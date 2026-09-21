@@ -1,15 +1,20 @@
 {
-  "version": "1.45.0",
+  "version": "1.80.0",
   "changes": {
     "en-US": [
-      "Display attachment types and file sizes consistently, with safer attachment rendering and editing across Web, Android, and iOS.",
-      "Load images and shared resources whose filenames contain Chinese or special characters correctly.",
-      "Keep Android local API forwarding available while the app is running to reduce request failures."
+      "Add block drag handles and formula insertion in the editor, with caret-aware insertion and a clearer table icon.",
+      "Show the Mac product name and physical screen resolution more accurately in system information.",
+      "Make emptying the trash reliable when it is already empty."
     ],
     "zh-CN": [
-      "统一展示附件类型与文件大小，并提升 Web、Android 和 iOS 上附件渲染与编辑的兼容性。",
-      "修复中文或特殊字符文件名导致图片及共享资源无法正常加载的问题。",
-      "保持 Android 应用运行期间的本地 API 转发可用，减少请求失败。"
+      "编辑器新增内容块拖拽手柄与公式插入，并支持在光标处插入公式及更清晰的表格图标。",
+      "系统信息现在能更准确地显示 Mac 产品名称和物理屏幕分辨率。",
+      "修复废纸篓已为空时再次清空可能失败的问题。"
+    ],
+    "ja": [
+      "エディターにブロックのドラッグハンドルと数式挿入を追加し、カーソル位置への挿入と分かりやすい表アイコンに対応しました。",
+      "システム情報でMacの製品名と物理画面解像度をより正確に表示するようになりました。",
+      "ゴミ箱がすでに空の場合でも、空にする操作が失敗しないよう修正しました。"
     ]
   }
 }

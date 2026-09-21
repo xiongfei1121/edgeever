@@ -1,10 +1,12 @@
 import react from "@vitejs/plugin-react";
+import { resolveDeploymentBuildMetadata } from "@edgeever/shared/deployment-metadata";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
-import { resolveAppVersion, resolveDeploymentMethod, resolveDeploymentTrigger, resolveReleaseTimestamp } from "./build-metadata";
+import { localDevelopmentAuth } from "./local-dev-auth";
+import { resolveAppVersion, resolveReleaseTimestamp } from "./build-metadata";
 
 const readPackageVersion = () => {
   try {
@@ -87,18 +89,7 @@ const releaseSummary = readReleaseSummary(packageVersion);
 const OPTIONAL_CHUNK_WARNING_LIMIT_KB = 1_700;
 const TARGET_VENDOR_CHUNK_BYTES = 450 * 1024;
 const releaseTimestamp = resolveReleaseTimestamp(process.env.EDGE_EVER_RELEASED_AT) || readLatestReleaseCommitTimestamp();
-const deploymentTrigger = resolveDeploymentTrigger(
-  process.env.EDGE_EVER_DEPLOYMENT_TRIGGER
-    ?? (process.env.WORKERS_CI_COMMIT_SHA ? "main_push" : undefined)
-);
-const deploymentMethod = resolveDeploymentMethod(
-  process.env.EDGE_EVER_DEPLOYMENT_METHOD
-    ?? (process.env.WORKERS_CI_COMMIT_SHA
-      ? "cloudflare_workers_builds"
-      : process.env.GITHUB_ACTIONS
-        ? "github_actions"
-        : undefined)
-);
+const deploymentMetadata = resolveDeploymentBuildMetadata(process.env);
 const isDesktopBuild = process.env.EDGE_EVER_DESKTOP_BUILD === "1";
 const developmentServiceWorkerReset: Plugin = {
   name: "edgeever-development-service-worker-reset",
@@ -141,15 +132,18 @@ export default defineConfig({
     __EDGEEVER_BUILD_LABEL__: JSON.stringify(buildId === "local" ? "local" : buildId.slice(0, 7)),
     __EDGEEVER_RELEASED_AT__: JSON.stringify(releaseTimestamp),
     __EDGEEVER_RELEASE_SUMMARY__: JSON.stringify(releaseSummary),
-    __EDGEEVER_DEPLOYMENT_TRIGGER__: JSON.stringify(deploymentTrigger),
-    __EDGEEVER_DEPLOYMENT_METHOD__: JSON.stringify(deploymentMethod),
+    __EDGEEVER_DEPLOYMENT_TRIGGER__: JSON.stringify(deploymentMetadata.trigger),
+    __EDGEEVER_DEPLOYMENT_METHOD__: JSON.stringify(deploymentMetadata.method),
     __EDGEEVER_DEVELOPMENT_PROFILE__: JSON.stringify(process.env.EDGE_EVER_DEVELOPMENT_PROFILE ?? ""),
+    __EDGEEVER_DESKTOP_BUILD__: JSON.stringify(isDesktopBuild),
   },
   plugins: [
+    localDevelopmentAuth(),
     developmentServiceWorkerReset,
     react(),
     VitePWA({
       registerType: "autoUpdate",
+      includeAssets: [],
       includeManifestIcons: false,
       manifest: {
         name: "EdgeEver",
@@ -182,29 +176,12 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,ico,png,svg,webp,woff2}"],
+        // Install-time precache excludes the app shell. The plugin still
+        // injects the web manifest so the app stays installable; other
+        // caches fill on first use.
+        globPatterns: [],
+        globIgnores: ["**/*"],
         cleanupOutdatedCaches: true,
-        additionalManifestEntries: [
-          {
-            revision: buildId,
-            url: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
-          },
-        ],
-        globIgnores: [
-          "index.html",
-          // Noto Sans SC is used only by the on-demand print entry. Precaching every
-          // CJK unicode-range shard adds ~4.5 MiB to every PWA installation.
-          "**/noto-sans-sc-*.woff2",
-          "**/*beautiful-mermaid*.js",
-          "**/*mermaid.core-*.js",
-          "**/vendor-mermaid-*.js",
-          "**/*Diagram-*.js",
-          "**/vendor-codemirror-*.js",
-          // PDF.js is loaded only when a PDF preview or thumbnail is rendered.
-          // Keep its runtime out of the install-time app-shell precache and cache
-          // it after first use instead.
-          "**/vendor~pdf-*.js",
-        ],
         navigateFallback: null,
         navigationPreload: true,
         runtimeCaching: [
@@ -218,9 +195,6 @@ export default defineConfig({
               networkTimeoutSeconds: 5,
               cacheableResponse: {
                 statuses: [0, 200],
-              },
-              precacheFallback: {
-                fallbackURL: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
               },
             },
           },
@@ -239,7 +213,18 @@ export default defineConfig({
             },
           },
           {
-            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-|vendor-codemirror)/.test(url.pathname),
+            urlPattern: ({ url }) => /\/assets\/i18n-ja-/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-optional-locales",
+              expiration: {
+                maxEntries: 8,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-|vendor-x6|vendor-codemirror)/.test(url.pathname),
             handler: "CacheFirst",
             options: {
               cacheName: "edgeever-optional-diagrams",
@@ -290,14 +275,14 @@ export default defineConfig({
     emptyOutDir: true,
     // ELK is distributed as one ~1.6 MiB module by beautiful-mermaid. It is
     // loaded only when a diagram is rendered and is excluded from HTML
-    // modulepreload and PWA precache; verify-web-performance.mjs enforces
-    // those constraints for every chunk above Vite's default 500 KiB limit.
+    // modulepreload; verify-web-performance.mjs enforces those constraints
+    // for every chunk above Vite's default 500 KiB limit.
     chunkSizeWarningLimit: OPTIONAL_CHUNK_WARNING_LIMIT_KB,
     modulePreload: isDesktopBuild
       ? false
       : {
           resolveDependencies: (_filename, dependencies) => dependencies.filter((dependency) =>
-            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating|codemirror|zod)|vendor-radix(?!-slot)|ui-primitives|ui-button-tooltip)/.test(dependency),
+            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating|codemirror|x6|zod)|vendor-radix(?!-slot)|ui-primitives|ui-button-tooltip|i18n-ja-)/.test(dependency),
           ),
         },
     rolldownOptions: {
@@ -330,9 +315,23 @@ export default defineConfig({
               // inherit the highlighter as a startup dependency.
             },
             {
+              name: "i18n-ja",
+              test: /[\\/]i18n[\\/](?:resources[\\/])?ja\.ts$/,
+              priority: 41,
+            },
+            {
               name: "vendor-react",
               test: /node_modules[\\/](react|react-dom|scheduler|react-router)[\\/]/,
               priority: 40,
+            },
+            {
+              name: "vendor-x6",
+              test: /node_modules[\\/]@antv[\\/]x6[\\/]/,
+              priority: 39,
+              // X6 initializes registries and plugins through a cyclic module
+              // graph. Size-based splitting can evaluate clipboard storage
+              // before Config is initialized, crashing the lazy diagram editor.
+              // Keep the graph atomic and defer the resulting chunk instead.
             },
             {
               name: "vendor-prosemirror",

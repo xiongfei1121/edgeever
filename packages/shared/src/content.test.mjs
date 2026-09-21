@@ -8,6 +8,9 @@ import {
   MERGE_DIVIDER_NODE_TYPE,
   FILE_ATTACHMENT_NODE_TYPE,
   PDF_ATTACHMENT_NODE_TYPE,
+  resolveFileDisplayMode,
+  PLUGIN_EMBED_NODE_TYPE,
+  pluginEmbedToMarkdown,
   mergeMemoDocs,
   resolvePdfDisplayMode,
   resolveMemoContentDoc,
@@ -151,6 +154,13 @@ describe("file attachment Markdown compatibility", () => {
   test("keeps an ordinary standalone web link as text", () => {
     const doc = markdownToDoc("[EdgeEver](https://edgeever.org)");
     expect(doc.content[0]?.content?.[0]?.type).toBe("text");
+  });
+
+  test("keeps video preview expanded unless compact display mode is stored", () => {
+    expect(resolveFileDisplayMode(undefined)).toBe("inline");
+    expect(resolveFileDisplayMode("inline")).toBe("inline");
+    expect(resolveFileDisplayMode("compact")).toBe("compact");
+    expect(resolveFileDisplayMode("hidden")).toBe("inline");
   });
 
   test("upgrades a legacy standalone attachment link from rich content", () => {
@@ -401,6 +411,134 @@ describe("Theme block compatibility", () => {
   });
 });
 
+describe("details fold blocks", () => {
+  test("parses GitHub details HTML and round-trips through Markdown", () => {
+    const markdown = `<details>
+<summary>展开看图</summary>
+
+hello **world**
+
+</details>`;
+    const doc = markdownToDoc(markdown);
+
+    expect(doc.content[0]).toMatchObject({
+      type: "details",
+      content: [
+        {
+          type: "detailsSummary",
+          content: [{ type: "text", text: "展开看图" }],
+        },
+        {
+          type: "detailsContent",
+          content: [{
+            type: "paragraph",
+            content: [
+              { type: "text", text: "hello " },
+              { type: "text", text: "world", marks: [{ type: "bold" }] },
+            ],
+          }],
+        },
+      ],
+    });
+
+    const serialized = docToMarkdown(doc);
+    expect(serialized).toContain("<details>");
+    expect(serialized).toContain("<summary>展开看图</summary>");
+    expect(serialized).toContain("hello **world**");
+    expect(markdownToDoc(serialized)).toEqual(doc);
+  });
+
+  test("converts an HTML image inside details into an image node", () => {
+    const markdown = `<details>
+<summary> </summary>
+<img src="https://example.com/a.png" alt="pic" title="t" />
+</details>`;
+    const doc = markdownToDoc(markdown);
+    expect(doc.content[0]?.content?.[1]?.content?.[0]).toMatchObject({
+      type: "image",
+      attrs: { src: "https://example.com/a.png", alt: "pic", title: "t" },
+    });
+    expect(docToMarkdown(doc)).toContain("![pic](https://example.com/a.png \"t\")");
+  });
+
+  test("keeps an image inside a details block", () => {
+    const markdown = `<details>
+<summary>图</summary>
+
+![pic](https://example.com/a.png)
+
+</details>`;
+    const doc = markdownToDoc(markdown);
+    expect(doc.content[0]?.type).toBe("details");
+    expect(doc.content[0]?.content?.[1]?.content?.[0]).toMatchObject({
+      type: "image",
+      attrs: { src: "https://example.com/a.png", alt: "pic" },
+    });
+    expect(docToMarkdown(doc)).toContain("![pic](https://example.com/a.png)");
+  });
+
+  test("recovers details from Markdown when JSON only kept the tags as text", () => {
+    const markdown = `<details>
+<summary>提示</summary>
+
+hidden
+
+</details>`;
+    const legacyDoc = {
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{ type: "text", text: markdown }],
+      }],
+    };
+
+    expect(resolveMemoContentDoc(legacyDoc, markdown).content[0]?.type).toBe("details");
+  });
+});
+
+describe("extra blank lines", () => {
+  test("keeps two visual blank lines as an empty paragraph", () => {
+    const doc = markdownToDoc("A\n\n\nB");
+    const emptyParagraphs = doc.content.filter((node) =>
+      node.type === "paragraph" && (!node.content || node.content.length === 0)
+    );
+
+    expect(emptyParagraphs).toHaveLength(1);
+    expect(doc.content.map((node) => node.type)).toEqual(["paragraph", "paragraph", "paragraph"]);
+  });
+
+  test("does not rewrite extra blank lines inside fenced code", () => {
+    const markdown = "before\n\n```\nline\n\n\nline\n```\n\nafter";
+    const doc = markdownToDoc(markdown);
+    const code = doc.content.find((node) => node.type === "codeBlock");
+
+    expect(code?.content?.[0]?.text).toBe("line\n\n\nline");
+  });
+});
+
+describe("image gallery compatibility", () => {
+  const galleryDoc = {
+    type: "doc",
+    content: [{
+      type: "edgeeverImageGallery",
+      attrs: { layout: "auto" },
+      content: [
+        { type: "image", attrs: { src: "/one.png", alt: "one" } },
+        { type: "image", attrs: { src: "/two.png", alt: "two" } },
+      ],
+    }],
+  };
+
+  test("exports gallery images as portable sequential Markdown", () => {
+    expect(docToMarkdown(galleryDoc)).toBe("![one](/one.png)\n\n![two](/two.png)");
+  });
+
+  test("keeps the richer gallery JSON when a Markdown projection also exists", () => {
+    expect(resolveMemoContentDoc(galleryDoc, "![one](/one.png)\n\n![two](/two.png)"))
+      .toEqual(galleryDoc);
+  });
+});
+
 describe("merge divider", () => {
   test("joins source docs with a semantic merge divider node", () => {
     const merged = mergeMemoDocs([
@@ -451,5 +589,25 @@ describe("merge divider", () => {
 
     const resolved = resolveMemoContentDoc(legacyDoc, markdown);
     expect(resolved.content.some((node) => node.type === MERGE_DIVIDER_NODE_TYPE)).toBe(true);
+  });
+});
+
+describe("plugin embed Markdown compatibility", () => {
+  test("round-trips a generic plugin embed without requiring the plugin renderer", () => {
+    const attributes = {
+      id: "embed_1",
+      pluginId: "org.edgeever.excalidraw",
+      type: "drawing",
+      resourceId: "res_scene",
+      previewResourceId: "res_preview",
+      title: "Architecture",
+      dataJson: JSON.stringify({ mode: "view" }),
+    };
+    const markdown = pluginEmbedToMarkdown(attributes);
+    const parsed = markdownToDoc(markdown);
+
+    expect(parsed.content[0]).toMatchObject({ type: PLUGIN_EMBED_NODE_TYPE, attrs: attributes });
+    expect(docToMarkdown(parsed)).toBe(markdown);
+    expect(resolveMemoContentDoc(parsed, "fallback").content[0].type).toBe(PLUGIN_EMBED_NODE_TYPE);
   });
 });
